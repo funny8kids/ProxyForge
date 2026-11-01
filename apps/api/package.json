@@ -1,0 +1,30 @@
+{
+  "name": "@proxyforge/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "dev:worker": "tsx watch src/worker/main.ts",
+    "start": "node dist/main.js",
+    "start:worker": "node dist/worker/main.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:seed": "tsx src/db/seed.ts",
+    "db:reset": "tsx src/db/reset.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.2.17",
+    "@fastify/cors": "^10.0.1",
+    "@proxyforge/contracts": "*",
+    "fastify": "^5.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

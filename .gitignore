@@ -1,0 +1,30 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+
+# 本地数据库（PGlite 数据目录，含迁移与种子结果）
+.data/
+
+# 截图与回归产物
+.shots/
+.shots-*/
+*.png
+!docs/**/*.png
+!prototype/**/*.png
+
+# 环境变量：.env.example 是模板，.env 是本机真实配置
+.env
+.env.local
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# 本机 AI 协作工具的会话与记忆，属于个人工作目录，不进仓库
+.workbuddy-ai/

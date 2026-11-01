@@ -1,0 +1,622 @@
+/**
+ * ProxyForge 共享契约层
+ * 单一真相：数据库 ENUM 与 API DTO 的 TypeScript 投影。
+ * 服务端与前端都从这里取类型，禁止各自复制一份。
+ */
+
+// ─────────────────────────────────────────────────────────────
+// 枚举（与 migrations/0001_schema_v1.sql 的 CREATE TYPE 一一对应）
+// ─────────────────────────────────────────────────────────────
+
+export const IP_TYPES = ['STATIC', 'DYNAMIC', 'UNKNOWN'] as const;
+export type IpType = (typeof IP_TYPES)[number];
+
+export const NETWORK_TYPES = ['RESIDENTIAL', 'DATACENTER', 'MOBILE', 'UNKNOWN'] as const;
+export type NetworkType = (typeof NETWORK_TYPES)[number];
+
+export const CONFIDENCES = ['DECLARED', 'OBSERVED', 'INFERRED', 'UNKNOWN'] as const;
+export type Confidence = (typeof CONFIDENCES)[number];
+
+export const PROXY_PROTOCOLS = ['HTTP', 'HTTPS_CONNECT', 'SOCKS4', 'SOCKS5'] as const;
+export type ProxyProtocol = (typeof PROXY_PROTOCOLS)[number];
+
+export const ORIGIN_TYPES = ['OWNED', 'FREE_PROVIDER', 'PUBLIC_PROXY', 'PAID_PROVIDER'] as const;
+export type OriginType = (typeof ORIGIN_TYPES)[number];
+
+export const AUTHORIZATION_STATUSES = ['AUTHORIZED', 'RESTRICTED', 'UNKNOWN', 'REVOKED'] as const;
+export type AuthorizationStatus = (typeof AUTHORIZATION_STATUSES)[number];
+
+/** 信任分级：决定"能用在什么场景"，与 authorization_status（有没有授权）正交 */
+export const TRUST_TIERS = ['PRIVATE_PROXY', 'PUBLIC_PROXY', 'VERIFIED_PROXY'] as const;
+export type TrustTier = (typeof TRUST_TIERS)[number];
+
+export const LIFECYCLE_STATUSES = [
+  'DISCOVERED',
+  'PENDING_VERIFICATION',
+  'VERIFIED',
+  'HEALTHY',
+  'DEGRADED',
+  'UNAVAILABLE',
+  'QUARANTINED',
+  'REJECTED',
+  'REVOKED',
+] as const;
+export type LifecycleStatus = (typeof LIFECYCLE_STATUSES)[number];
+
+export const POLICY_STRATEGIES = [
+  'DIRECT',
+  'FIXED',
+  'FASTEST',
+  'WEIGHTED',
+  'STICKY',
+  'FAILOVER',
+  'REGION',
+] as const;
+export type PolicyStrategy = (typeof POLICY_STRATEGIES)[number];
+
+export const CHECK_FAILURE_REASONS = [
+  'NONE',
+  'DNS_FAILURE',
+  'TCP_REFUSED',
+  'TCP_TIMEOUT',
+  'TLS_ERROR',
+  'PROTOCOL_ERROR',
+  'AUTH_FAILED',
+  'EXIT_MISMATCH',
+  'TIMEOUT',
+  'UNSTABLE',
+  'FLAKY',
+  'INTERNAL',
+] as const;
+export type CheckFailureReason = (typeof CHECK_FAILURE_REASONS)[number];
+
+export const USER_ROLES = ['ADMIN', 'OPERATOR', 'VIEWER'] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+
+export const AI_PROVIDER_TYPES = [
+  'OPENAI_COMPATIBLE',
+  'ANTHROPIC',
+  'OLLAMA',
+  'CUSTOM',
+] as const;
+export type AiProviderType = (typeof AI_PROVIDER_TYPES)[number];
+
+export const AI_TASK_TYPES = [
+  'DISCOVERY',
+  'ANALYZER',
+  'CLASSIFIER',
+  'EVALUATOR',
+  'ASSISTANT',
+] as const;
+export type AiTaskType = (typeof AI_TASK_TYPES)[number];
+
+export const JOB_STATUSES = ['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED'] as const;
+export type JobStatus = (typeof JOB_STATUSES)[number];
+
+// ─────────────────────────────────────────────────────────────
+// 通用信封
+// ─────────────────────────────────────────────────────────────
+
+export interface Page<T> {
+  items: T[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  total: number;
+}
+
+/** RFC 9457 Problem Details */
+export interface ProblemDetail {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+  instance?: string;
+  code: ErrorCode;
+  requestId: string;
+  errors?: Array<{ field: string; message: string }>;
+}
+
+export type ErrorCode =
+  | 'INVALID_ARGUMENT'
+  | 'PARSE_FAILED'
+  | 'UNAUTHENTICATED'
+  | 'FORBIDDEN'
+  | 'AUTHORIZATION_REQUIRED'
+  | 'TIER_UPGRADE_FORBIDDEN'
+  | 'SELF_REVIEW_FORBIDDEN'
+  | 'PUBLIC_PROXY_GATEWAY_FORBIDDEN'
+  | 'SIGNATURE_VERSION_UNSUPPORTED'
+  | 'SIGNING_KEY_UNAVAILABLE'
+  | 'NOT_FOUND'
+  | 'VERSION_CONFLICT'
+  | 'DUPLICATE_KEY'
+  | 'POLICY_UNSATISFIABLE'
+  | 'RATE_LIMITED'
+  | 'INTERNAL'
+  | 'AI_UNAVAILABLE'
+  | 'ENGINE_UNAVAILABLE';
+
+// ─────────────────────────────────────────────────────────────
+// 资源端点（对外视图）
+// ─────────────────────────────────────────────────────────────
+
+export interface EndpointHealth {
+  success: boolean;
+  lastCheckAt: string | null;
+  lastSuccessAt: string | null;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  jitterMs: number | null;
+  successRate24h: number | null;
+  qualityScore: number;
+}
+
+export interface EndpointSummary {
+  id: string;
+  protocol: ProxyProtocol;
+  host: string;
+  port: number;
+  displayName: string | null;
+  originType: OriginType;
+  trustTier: TrustTier;
+  authorizationStatus: AuthorizationStatus;
+  lifecycleStatus: LifecycleStatus;
+  explicitGatewayGrant: boolean;
+  qualityScore: number;
+  countryCode: string | null;
+  region: string | null;
+  tags: string[];
+  expectedCountry: string | null;
+  lastVerifiedAt: string | null;
+  health: EndpointHealth | null;
+}
+
+export interface EndpointDetail extends EndpointSummary {
+  nodeId: string | null;
+  sourceId: string | null;
+  ipAssetId: string | null;
+  networkType: NetworkType;
+  ipType: IpType;
+  asn: number | null;
+  asOrg: string | null;
+  isp: string | null;
+  city: string | null;
+  labels: Record<string, unknown>;
+  credentialRef: string | null;
+  createdAt: string;
+  updatedAt: string;
+  version: number;
+  pools: Array<{ id: string; key: string; name: string }>;
+  recentChecks: HealthCheckRow[];
+}
+
+export interface HealthCheckRow {
+  checkedAt: string;
+  success: boolean;
+  failureReason: CheckFailureReason;
+  failedLayer: number | null;
+  dnsMs: number | null;
+  tcpMs: number | null;
+  handshakeMs: number | null;
+  totalMs: number | null;
+  exitIp: string | null;
+  exitCountry: string | null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 导入 / 候选
+// ─────────────────────────────────────────────────────────────
+
+export interface ImportRequest {
+  mode: 'TEXT' | 'FILE' | 'URL';
+  sourceKey?: string;
+  content: string;
+  defaultProtocol?: ProxyProtocol;
+  defaultOriginType?: OriginType;
+  trustTier?: TrustTier;
+}
+
+export interface ImportResult {
+  jobId: string;
+  total: number;
+  imported: number;
+  duplicated: number;
+  skipped: number;
+  failed: number;
+  errors: Array<{ lineNo: number; rawValue: string; reason: string }>;
+}
+
+export interface CandidateRow {
+  id: string;
+  sourceId: string;
+  rawValue: string;
+  protocol: ProxyProtocol | null;
+  host: string | null;
+  port: number | null;
+  reviewStatus: 'PENDING' | 'PROMOTED' | 'REJECTED' | 'DUPLICATE';
+  authorizationGuess: AuthorizationStatus;
+  rejectReason: string | null;
+  createdAt: string;
+}
+
+/** 资源来源。`protocolHint` 从 config 里提出来，界面要直接显示它。 */
+export interface SourceSummary {
+  id: string;
+  key: string;
+  name: string;
+  type: 'GITHUB_REPO' | 'WEB_PAGE' | 'API' | 'CSV_FEED' | 'MIHOMO_SUB' | 'MANUAL';
+  url: string | null;
+  formatHint: string | null;
+  protocolHint: ProxyProtocol | null;
+  authorizationStatus: AuthorizationStatus;
+  trustLevel: number;
+  enabled: boolean;
+  syncIntervalSeconds: number;
+  lastSyncedAt: string | null;
+  notes: string | null;
+  /** 待处理候选数 */
+  pendingCandidates: number;
+  /** 该源累计产出的候选数（不含已处理的） */
+  totalCandidates: number;
+  /** 已晋级为端点的数量 */
+  promotedCandidates: number;
+}
+
+export interface SourceSyncOutcome {
+  sourceId: string;
+  key: string;
+  name: string;
+  ok: boolean;
+  snapshotId: string | null;
+  entries: number;
+  candidates: number;
+  duplicateSnapshot: boolean;
+  format: string;
+  warnings: string[];
+  error?: string;
+  durationMs: number;
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// 验证
+// ─────────────────────────────────────────────────────────────
+
+export interface VerificationJobRow {
+  id: string;
+  scope: 'ENDPOINT' | 'ENDPOINTS' | 'POOL' | 'ALL_PENDING' | 'ALL';
+  status: JobStatus;
+  total: number;
+  completed: number;
+  failedCount: number;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface VerificationRunRequest {
+  scope: VerificationJobRow['scope'];
+  endpointIds?: string[];
+  poolId?: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 资源池
+// ─────────────────────────────────────────────────────────────
+
+export interface PoolRule {
+  id: string;
+  ruleOrder: number;
+  name: string;
+  predicate: Record<string, unknown>;
+  enabled: boolean;
+}
+
+export interface PoolSummary {
+  id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  purpose: string | null;
+  minQuality: number;
+  maxMembers: number | null;
+  memberCount: number;
+  allowedTiers: TrustTier[];
+  experimental: boolean;
+  enabled: boolean;
+  version: number;
+  health: { healthy: number; degraded: number; avgQuality: number | null };
+}
+
+export interface PoolDetail extends PoolSummary {
+  rules: PoolRule[];
+  members: PoolMemberRow[];
+}
+
+export interface PoolMemberRow {
+  endpointId: string;
+  displayName: string | null;
+  host: string;
+  port: number;
+  protocol: ProxyProtocol;
+  trustTier: TrustTier;
+  source: 'AUTO' | 'MANUAL';
+  weight: number;
+  suppressed: boolean;
+  suppressReason: string | null;
+  qualityScore: number;
+  lifecycleStatus: LifecycleStatus;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 策略 / 网关
+// ─────────────────────────────────────────────────────────────
+
+export interface PolicyRow {
+  id: string;
+  key: string;
+  name: string;
+  strategy: PolicyStrategy;
+  poolId: string;
+  poolKey: string;
+  /** 绑定的网关实例；正式与实验策略必须绑到不同实例 */
+  instanceId: string | null;
+  listenPort: number;
+  enabled: boolean;
+  priority: number;
+  regionFilter: string[];
+  protocolFilter: ProxyProtocol[];
+  maxMembers: number | null;
+  stickyTtlSeconds: number;
+  version: number;
+  /** 编译结果摘要：本次编译选中多少成员 */
+  compiledMembers?: number;
+}
+
+export interface CompiledPolicy {
+  policyKey: string;
+  listenPort: number;
+  strategy: PolicyStrategy;
+  members: Array<{
+    endpointId: string;
+    host: string;
+    port: number;
+    protocol: ProxyProtocol;
+    weight: number;
+    trustTier: TrustTier;
+  }>;
+  warnings: CompileWarning[];
+}
+
+export interface CompileWarning {
+  code:
+    | 'EMPTY_POOL'
+    | 'TIER_EXCLUDED'
+    | 'AUTHORIZATION_MISSING'
+    | 'UNHEALTHY_EXCLUDED'
+    | 'MAX_MEMBERS_TRUNCATED'
+    | 'PUBLIC_PROXY_EXPERIMENTAL_ONLY'
+    | 'POLICY_UNBOUND';
+  message: string;
+  count?: number;
+}
+
+export interface GatewayInstanceRow {
+  id: string;
+  name: string;
+  engine: string;
+  status: string;
+  bindHost: string;
+  httpPort: number;
+  socksPort: number;
+  activeConfigVersion: number | null;
+  lastSeenAt: string | null;
+}
+
+export interface GatewayConfigRow {
+  id: string;
+  instanceId: string;
+  version: number;
+  status: 'DRAFT' | 'COMPILED' | 'APPLIED' | 'FAILED' | 'SUPERSEDED' | 'ROLLED_BACK';
+  configHash: string;
+  renderedConfig: string;
+  policyIds: string[];
+  warnings: CompileWarning[];
+  error: string | null;
+  appliedAt: string | null;
+  createdAt: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 订阅
+// ─────────────────────────────────────────────────────────────
+
+export interface SubscriptionRow {
+  id: string;
+  name: string;
+  poolId: string;
+  poolKey: string;
+  /** 默认导出格式；拉取时可用 ?format= 覆盖 */
+  format: 'mihomo' | 'clash' | 'singbox' | 'base64' | 'plain';
+  tokenPrefix: string;
+  signingEnabled: boolean;
+  revision: number;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  lastAccessedAt: string | null;
+  accessCount: number;
+  createdAt: string;
+}
+
+export interface SubscriptionCreated extends SubscriptionRow {
+  /** 明文 token，仅创建时返回一次 */
+  token: string;
+  url: string;
+  warning: string;
+}
+
+export interface SigningKeyRow {
+  keyId: string;
+  algorithm: 'Ed25519';
+  publicKey: string;
+  status: 'ACTIVE' | 'STANDBY' | 'RETIRED' | 'COMPROMISED';
+  signatureVersion: number;
+  notBefore: string;
+  notAfter: string | null;
+  activatedAt: string | null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 信任分级
+// ─────────────────────────────────────────────────────────────
+
+export interface TrustSummary {
+  tiers: Array<{
+    tier: TrustTier;
+    total: number;
+    healthy: number;
+    degraded: number;
+    unavailable: number;
+    /** 该分级是否可进入正式网关 */
+    gatewayEligible: boolean;
+  }>;
+  pendingPromotions: number;
+  publicProxyHealthRate: number | null;
+}
+
+export interface PromotionSuggestionRow {
+  id: string;
+  endpointId: string | null;
+  candidateId: string | null;
+  suggestedTier: TrustTier;
+  currentTier: TrustTier | null;
+  confidence: number;
+  rationale: string | null;
+  /**
+   * 理由的机器可读码。界面按当前语言渲染，`rationale` 原文只在
+   * code 为空时作为回退（外部 LLM 产出的自由文本没有 code）。
+   */
+  rationaleCode?: string | null;
+  rationaleParams?: Record<string, unknown>;
+  source: 'AI' | 'RULE' | 'HUMAN';
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  reviewedBy: string | null;
+  createdAt: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 分析
+// ─────────────────────────────────────────────────────────────
+
+export interface OverviewAnalytics {
+  counters: {
+    totalEndpoints: number;
+    schedulable: number;
+    healthy: number;
+    degraded: number;
+    quarantined: number;
+    pendingVerification: number;
+  };
+  tiers: Array<{ tier: TrustTier; count: number }>;
+  protocolMix: Array<{ protocol: ProxyProtocol; count: number }>;
+  originMix: Array<{ originType: OriginType; count: number }>;
+  qualityTrend: Array<{ day: string; avgQuality: number; checks: number; successRate: number }>;
+  regionDistribution: Array<{ countryCode: string; count: number; avgLatency: number | null }>;
+  topEndpoints: Array<{
+    id: string;
+    displayName: string | null;
+    countryCode: string | null;
+    p50Ms: number | null;
+    successRate24h: number | null;
+    qualityScore: number;
+  }>;
+  gatewayTraffic: Array<{ bucket: string; connections: number; bytesIn: number; bytesOut: number }>;
+}
+
+/** /gateway/traffic 的单个小时桶。比 overview 多一个 errors 计数。 */
+export interface GatewayTrafficPoint {
+  bucket: string;
+  connections: number;
+  bytesIn: number;
+  bytesOut: number;
+  errors: number;
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI
+// ─────────────────────────────────────────────────────────────
+
+export interface AiProviderRow {
+  id: string;
+  key: string;
+  name: string;
+  type: AiProviderType;
+  baseUrl: string;
+  apiKeyMasked: string | null;
+  enabled: boolean;
+  timeoutMs: number;
+  allowPrivateNetwork: boolean;
+  budgetMonthlyUsd: number | null;
+  spentCurrentMonth: number;
+  lastTestedAt: string | null;
+  lastTestOk: boolean | null;
+  models: Array<{ modelName: string; displayName: string | null; enabled: boolean }>;
+}
+
+export interface AiTaskBindingRow {
+  taskType: AiTaskType;
+  chain: Array<{
+    providerId: string;
+    providerKey: string;
+    providerName: string;
+    modelId: string;
+    modelName: string;
+    priority: number;
+    enabled: boolean;
+  }>;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 审计
+// ─────────────────────────────────────────────────────────────
+
+export interface AuditEventRow {
+  id: number;
+  occurredAt: string;
+  actorType: 'USER' | 'API_KEY' | 'SYSTEM' | 'SCHEDULER';
+  actorId: string | null;
+  action: string;
+  resourceType: string | null;
+  resourceId: string | null;
+  sourceIp: string | null;
+  requestId: string | null;
+  beforeState: unknown;
+  afterState: unknown;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 系统状态
+// ─────────────────────────────────────────────────────────────
+
+export interface SystemStatus {
+  version: string;
+  uptimeSeconds: number;
+  db: { ok: boolean; latencyMs: number };
+  gateway: { status: 'APPLIED' | 'STALE' | 'FAILED' | 'UNKNOWN'; configVersion: number | null };
+  outbox: { pending: number; failed: number };
+  worker: {
+    lastHeartbeatAt: string | null;
+    /**
+     * 周期任务的累计错误数与本进程最后一次错误。
+     * 没有这两个字段时，「池重算每轮都抛异常」只能靠翻日志发现 ——
+     * 它会连续几天静默地把所有池成员算成 0。
+     */
+    errors?: number;
+    lastError?: string | null;
+    lastErrorAt?: string | null;
+  };
+  /** 三层平面的进程边界自检结果 */
+  planes: { control: boolean; data: boolean; intelligence: boolean };
+}

@@ -1,0 +1,32 @@
+{
+  "name": "proxyforge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ProxyForge — Network Resource Control Plane",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "db:migrate": "npm run -w @proxyforge/api db:migrate",
+    "db:seed": "npm run -w @proxyforge/api db:seed",
+    "db:reset": "npm run -w @proxyforge/api db:reset",
+    "dev:api": "npm run -w @proxyforge/api dev",
+    "dev:worker": "npm run -w @proxyforge/api dev:worker",
+    "dev:web": "npm run -w @proxyforge/web dev",
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api build && npm run -w @proxyforge/web build",
+    "typecheck": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api typecheck && npm run -w @proxyforge/web typecheck",
+    "verify": "node scripts/verify.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.2"
+  }
+}

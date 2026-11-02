@@ -283,6 +283,14 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
   // 每档用 row_number 取"该档内欠得最多的前 share 比例个"，实现保底份额。
   // 用窗口函数而不是发 7 条查询：一次扫描就够，也不用担心七次扫描之间
   // 数据变了导致份额被打破。
+  //
+  // 同档内**池成员优先**。理由很直接：池成员是真正会被下发到订阅里的
+  // 那批节点，它们的状态陈旧度直接等于用户看到的故障率；而池外节点
+  // 探得再勤也不产出。实测过一次：池里 181 个成员 / HEALTHY 配额
+  // 每分钟约 56 个，池成员优先后 3 分钟就能轮一遍，订阅几乎始终新鲜。
+  //
+  // 注意这只改变档位**内部**的顺序，不改变档位之间的份额分配 ——
+  // 跨档优先级仍由 t.prio 与 share 决定，池外节点不会被饿死。
   const recheck = recheckQuota > 0
     ? (
         await q<{ id: string }>(
@@ -292,9 +300,16 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
              SELECT e.id,
                     e.lifecycle_status::text AS status,
                     ${OVERDUE_RATIO} AS ratio,
+                    EXISTS (
+                      SELECT 1 FROM resource_pool_members m
+                      WHERE m.endpoint_id = e.id AND m.suppressed = false
+                    ) AS in_pool,
                     row_number() OVER (
                       PARTITION BY e.lifecycle_status
-                      ORDER BY ${OVERDUE_RATIO} DESC
+                      ORDER BY EXISTS (
+                        SELECT 1 FROM resource_pool_members m2
+                        WHERE m2.endpoint_id = e.id AND m2.suppressed = false
+                      ) DESC, ${OVERDUE_RATIO} DESC
                     ) AS rn
              FROM proxy_endpoints e
              JOIN tier t ON t.status = e.lifecycle_status::text
@@ -306,7 +321,7 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
            FROM cand c
            JOIN tier t ON t.status = c.status
            WHERE c.rn <= GREATEST(1, ceil($1::numeric * t.share))
-           ORDER BY t.prio DESC, c.ratio DESC`,
+           ORDER BY t.prio DESC, c.in_pool DESC, c.ratio DESC`,
           [recheckQuota],
         )
       ).slice(0, recheckQuota)

@@ -273,6 +273,65 @@ await check('DEGRADED 超过 30 分钟 → 入队；未满 30 分钟的不入队
   await clearSchedulerJobs();
 });
 
+console.log('\n[2b] 池成员优先复探');
+
+/**
+ * 造一个池并把端点加进去。
+ *
+ * 池成员是真正会被下发到订阅里的那批节点，它们的状态陈旧度直接等于
+ * 用户看到的故障率；池外节点探得再勤也不产出。所以同档内要让池成员先探。
+ */
+const TEST_POOL_ID = '00000000-0000-7000-8000-000000000001';
+async function addToPool(endpointId: string): Promise<void> {
+  await exec(
+    `INSERT INTO resource_pools (id, key, name, min_quality, max_members, allowed_tiers, experimental, enabled)
+     VALUES ($1, 'TEST_POOL', '测试池', 0, 1000, ARRAY['PUBLIC_PROXY']::trust_tier[], false, true)
+     ON CONFLICT (id) DO NOTHING`,
+    [TEST_POOL_ID],
+  );
+  await exec(
+    `INSERT INTO resource_pool_members (pool_id, endpoint_id, weight, source, suppressed)
+     VALUES ($1, $2, 100, 'AUTO', false)
+     ON CONFLICT (pool_id, endpoint_id) DO NOTHING`,
+    [TEST_POOL_ID, endpointId],
+  );
+}
+
+await check('同档内池成员排在池外节点前面', async () => {
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  // 两个节点超期程度完全相同 —— 唯一能区分它们的只有「是否池成员」
+  const inPool = await mkEndpoint('HEALTHY', 400);
+  const outside = await mkEndpoint('HEALTHY', 400);
+  await addToPool(inPool);
+
+  const r = await enqueueDueProbes();
+  const ids = await jobEndpointIds(r.jobId!);
+  assert.ok(ids.includes(inPool) && ids.includes(outside), '两个都该入队');
+  assert.ok(
+    ids.indexOf(inPool) < ids.indexOf(outside),
+    '池成员必须先探：它才是会下发到订阅里的那个',
+  );
+  await clearSchedulerJobs();
+});
+
+await check('池成员优先不会改变档位之间的份额', async () => {
+  // 反面断言：这只是同档内的顺序调整，不能让 HEALTHY 抢走 VERIFIED 的配额
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  const verifiedIds: string[] = [];
+  for (let i = 0; i < 60; i += 1) verifiedIds.push(await mkEndpoint('VERIFIED', 60));
+  for (let i = 0; i < 60; i += 1) await addToPool(await mkEndpoint('HEALTHY', 400));
+
+  const r = await enqueueDueProbes(20);
+  const ids = await jobEndpointIds(r.jobId!);
+  assert.ok(
+    ids.some((id) => verifiedIds.includes(id)),
+    'VERIFIED 是通往 HEALTHY 的关键路径，不能被池成员挤光',
+  );
+  await clearSchedulerJobs();
+});
+
 console.log('\n[3] 排序与优先级');
 
 await check('同档内：超期更狠的先探', async () => {

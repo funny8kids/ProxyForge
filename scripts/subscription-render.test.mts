@@ -19,7 +19,12 @@ import {
   normalizeRoutingMode,
   type ExportProxy,
 } from '../apps/api/src/modules/subscription/render.js';
-import { applyNameTemplate, applyNodeFilter, normalizeNodeFilter } from '../apps/api/src/modules/subscription/filter.js';
+import {
+  applyNameTemplate,
+  applyNodeFilter,
+  excludeTunnelIncapable,
+  normalizeNodeFilter,
+} from '../apps/api/src/modules/subscription/filter.js';
 
 let pass = 0;
 let fail = 0;
@@ -399,6 +404,36 @@ check('空池不生成 urltest / selector（空成员数组会让 sing-box 启�
   assert.equal(cfg.outbounds.filter((o: { type: string }) => o.type === 'urltest').length, 0);
   assert.equal(cfg.outbounds.filter((o: { type: string }) => o.type === 'selector').length, 0);
   assert.equal(cfg.route.final, 'direct');
+});
+
+console.log('\n[10] 剔除建不起隧道的节点');
+
+// 这类节点的表现是「已连接、延迟 80ms，但所有网站打不开」——
+// 实测 6 个 connect_ok=false 的节点，http 探测 4 个返回 204，
+// https 探测 6 个全部失败。发进订阅只会制造难以排查的故障。
+
+check('connect_ok=false 的节点被剔除', () => {
+  const rows = [
+    { connect_ok: true as boolean | null },
+    { connect_ok: false as boolean | null },
+    { connect_ok: null as boolean | null },
+  ];
+  assert.deepEqual(excludeTunnelIncapable(rows).map((r) => r.connect_ok), [true, null]);
+});
+
+check('connect_ok=null 保留 —— 未知不等于不能用', () => {
+  const rows = [{ connect_ok: null as boolean | null }, { connect_ok: null as boolean | null }];
+  assert.equal(excludeTunnelIncapable(rows).length, 2);
+});
+
+check('全是 false 时退回原集合，不产出空订阅', () => {
+  // 空订阅在客户端里表现为「加载失败」，比发一批坏节点更糟
+  const rows = [{ connect_ok: false as boolean | null }, { connect_ok: false as boolean | null }];
+  assert.equal(excludeTunnelIncapable(rows).length, 2, '不能把订阅过滤成空文件');
+});
+
+check('空输入不会报错', () => {
+  assert.deepEqual(excludeTunnelIncapable([]), []);
 });
 
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);

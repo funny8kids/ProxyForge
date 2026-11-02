@@ -60,18 +60,15 @@ async function resolvePool(): Promise<string> {
 const POOL = await resolvePool();
 
 const res = await fetch(`${BASE}/pools/${POOL}/members`, { headers: auth });
-const members = ((await res.json()) as { items?: Member[] }).items ?? [];
+const allMembers = ((await res.json()) as { items?: Member[] }).items ?? [];
+// 订阅会剔除 connect_ok=false 的节点（建不起 CONNECT 隧道，对 HTTPS 无用），
+// 这里跟着剔，否则分桶出来的"位置"比真实订阅靠后。
+const members = allMembers.filter((m) => m.connect_ok !== false);
+const dropped = allMembers.length - members.length;
 
-// 订阅取数的排序：connect_ok DESC NULLS LAST, 新鲜度分档, quality_score DESC
-// 接口没给 last_success_at，先用 connect_ok + quality 近似 —— 对分桶判断足够。
-members.sort((a, b) => {
-  const ca = a.connect_ok === null ? 0 : a.connect_ok ? 2 : 1;
-  const cb = b.connect_ok === null ? 0 : b.connect_ok ? 2 : 1;
-  if (ca !== cb) return cb - ca;
-  return Number(b.quality_score) - Number(a.quality_score);
-});
-
-// 并发拉健康状态，控制在 24 路以内，避免把 API 打满
+// 并发拉健康状态，控制在 24 路以内，避免把 API 打满。
+// 必须先拉完才能排序 —— 真实订阅顺序里的第二排序键是「新鲜度分档」，
+// 而成员接口不返回 last_success_at。
 const health = new Map<string, Health>();
 const queue = [...members];
 async function worker(): Promise<void> {
@@ -94,6 +91,31 @@ function ageMinutes(iso: string | null): number | null {
   return (now - new Date(iso).getTime()) / 60000;
 }
 
+/**
+ * 新鲜度分档，与 loadExportProxies 的 ORDER BY 保持一致。
+ *
+ * 这里必须复刻真实排序，否则分桶出来的"位置"不是用户实际看到的位置 ——
+ * 那样会得出「排在前面的反而不新鲜」的错误结论。
+ */
+function freshTier(m: Member): number {
+  const age = ageMinutes(health.get(m.endpoint_id)?.last_success_at ?? null);
+  if (age === null) return 3;
+  if (age <= 10) return 0;
+  if (age <= 30) return 1;
+  if (age <= 120) return 2;
+  return 3;
+}
+
+members.sort((a, b) => {
+  const ca = a.connect_ok === null ? 0 : a.connect_ok ? 2 : 1;
+  const cb = b.connect_ok === null ? 0 : b.connect_ok ? 2 : 1;
+  if (ca !== cb) return cb - ca;
+  const fa = freshTier(a);
+  const fb = freshTier(b);
+  if (fa !== fb) return fa - fb;
+  return Number(b.quality_score) - Number(a.quality_score);
+});
+
 function bucket(age: number | null): string {
   if (age === null) return '从未成功';
   if (age <= 10) return '≤10m';
@@ -115,7 +137,7 @@ const BANDS = [
 ].filter((b) => b.from < total);
 
 console.log(`\n池 ${POOL}`);
-console.log(`成员 ${total} 个，拿到健康状态 ${health.size} 个\n`);
+console.log(`成员 ${total} 个（另有 ${dropped} 个建不起隧道、订阅已剔除），拿到健康状态 ${health.size} 个\n`);
 
 const header = ['区间'.padEnd(12), ...ORDER.map((b) => b.padStart(9)), '  新鲜率'].join(' ');
 console.log(header);

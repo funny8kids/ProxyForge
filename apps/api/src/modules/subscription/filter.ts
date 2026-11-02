@@ -118,6 +118,28 @@ export interface FilterableEndpoint {
 }
 
 /**
+ * 剔除**已判定不能建 CONNECT 隧道**的节点。
+ *
+ * 这不是偏好问题，是能力问题：现代网站几乎全是 HTTPS，一个能转发明文
+ * HTTP、却建不起隧道的节点，在客户端里只会表现为"已连接、延迟 80ms，
+ * 但所有网站打不开"。实测 6 个这类节点：用 http 探测 4 个返回 204，
+ * 用 https 探测 6 个全部失败。
+ *
+ * 为什么必须在服务端剔除而不是靠排序：订阅是一次性快照，客户端拿到
+ * 几百个节点后 url-test 会挨个测。把它们排在最后只是让测速更慢，
+ * 并不会让它们消失 —— 而它们一旦被选中，用户看到的就是故障。
+ *
+ * 两条边界：
+ *   · `connect_ok IS NULL`（还没测过）**保留** —— 未知不等于不能用
+ *   · 如果过滤后为空，退回原集合 —— 空订阅在客户端里表现为"加载失败"，
+ *     比发一批坏节点更糟
+ */
+export function excludeTunnelIncapable<T extends { connect_ok: boolean | null }>(rows: T[]): T[] {
+  const capable = rows.filter((r) => r.connect_ok !== false);
+  return capable.length > 0 ? capable : rows;
+}
+
+/**
  * 应用过滤条件。
  *
  * 协议白名单与黑名单同时给出时，白名单先算 —— 黑名单只用来从白名单里剔。

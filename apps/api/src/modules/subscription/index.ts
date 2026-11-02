@@ -23,7 +23,7 @@ import {
   type ExportProxy,
   type RoutingMode,
 } from './render.js';
-import { applyNameTemplate, applyNodeFilter, normalizeNodeFilter } from './filter.js';
+import { applyNameTemplate, applyNodeFilter, excludeTunnelIncapable, normalizeNodeFilter } from './filter.js';
 
 /**
  * 订阅渲染与签名（ADR-0008 / ADR-0009 / SEC-001 §6.4）
@@ -799,7 +799,10 @@ async function loadExportProxies(
   // 过滤在取数之后：500 条内存筛选是微秒级，没必要把条件翻成动态 SQL ——
   // 动态拼接的 WHERE 是这类接口最容易出的注入点。
   const filter = normalizeNodeFilter(settings.node_filter);
-  const kept = applyNodeFilter(endpoints, filter);
+  // 再剔掉已判定不能建隧道的节点：它们的表现是"已连接但所有网站打不开"，
+  // 详见 excludeTunnelIncapable 的注释。放在用户过滤之后，避免影响
+  // maxNodes 的计数口径（用户要 100 个，就该拿到 100 个能用的）。
+  const kept = excludeTunnelIncapable(applyNodeFilter(endpoints, filter));
 
   // 带认证的代理要把账号密码一并交给客户端，否则节点在 Clash 里永远是超时。
   // 凭据在库里是密文，这里一次性取出解密；解密失败不能拖垮整份订阅 ——

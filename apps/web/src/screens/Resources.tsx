@@ -1,12 +1,13 @@
 import { useMemo, useState } from 'react';
 import { Icon } from '../components/Icon';
-import { Badge, Drawer, Empty, ErrorNote, KV, Panel, Progress, Skeleton } from '../components/ui';
+import { Badge, CountryBadge, Drawer, Empty, ErrorNote, KV, Panel, Progress, Skeleton } from '../components/ui';
 import { api, ApiError } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { useI18n } from '../lib/i18n';
 import {
   authorizationLabel,
   countryLabel,
+  countryName,
   failureLabel,
   lifecycleLabel,
   lifecycleTone,
@@ -24,6 +25,7 @@ export function Resources(): JSX.Element {
   const { t, lang } = useI18n();
   const [tier, setTier] = useState<string>('');
   const [status, setStatus] = useState<string>('');
+  const [country, setCountry] = useState<string>('');
   const [cursor, setCursor] = useState<string>('');
   const [openId, setOpenId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
@@ -34,11 +36,20 @@ export function Resources(): JSX.Element {
     p.set('limit', '25');
     if (tier) p.set('tier', tier);
     if (status) p.set('status', status);
+    if (country) p.set('country', country);
     if (cursor) p.set('cursor', cursor);
     return p.toString();
-  }, [tier, status, cursor]);
+  }, [tier, status, country, cursor]);
 
   const { data, error, loading, reload } = useAsync(() => api.resources(query), [query]);
+  /**
+   * 国家下拉的选项。
+   *
+   * 用分布接口而不是从当前页的 25 条里推：那一页是按质量排序的，
+   * 前 25 名可能全在同一个国家，下拉里就只有那一个国家可选 ——
+   * 用户会以为系统只支持这一个地区。
+   */
+  const dist = useAsync(() => api.distribution(), []);
 
   const quarantine = async (id: string): Promise<void> => {
     setBusy(true);
@@ -60,8 +71,15 @@ export function Resources(): JSX.Element {
     setStatus(v);
     setCursor('');
   };
+  const pickCountry = (v: string): void => {
+    setCountry(v);
+    setCursor('');
+  };
 
   const items = data?.items ?? [];
+  const countryOptions = (dist.data?.items ?? [])
+    .filter((d): d is { key: string; count: number } => !!d.key)
+    .sort((a, b) => b.count - a.count);
 
   return (
     <div className="screen">
@@ -109,6 +127,21 @@ export function Resources(): JSX.Element {
             </button>
           ))}
         </div>
+        <div className="fgroup">
+          <select
+            className="select sm"
+            value={country}
+            onChange={(e) => pickCountry(e.target.value)}
+            aria-label={t('Country')}
+          >
+            <option value="">{t('All countries')}</option>
+            {countryOptions.map((c) => (
+              <option value={c.key} key={c.key}>
+                {countryName(c.key)} · {c.count}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {error && <ErrorNote message={error} />}
@@ -153,7 +186,9 @@ export function Resources(): JSX.Element {
                         {t(lifecycleLabel[e.lifecycleStatus] ?? e.lifecycleStatus)}
                       </Badge>
                     </td>
-                    <td>{countryLabel(e.countryCode)}</td>
+                    <td>
+                      <CountryBadge code={e.countryCode} />
+                    </td>
                     <td className="num" style={{ textAlign: 'right' }}>
                       {ms(e.health?.p50Ms ?? null)}
                     </td>
@@ -375,7 +410,7 @@ function EndpointDrawer({
       title={e ? `${e.host}:${e.port}` : t('Resource detail')}
       sub={
         e
-          ? `${e.protocol} · ${t(tierLabel[e.trustTier] ?? e.trustTier)} · ${countryLabel(e.countryCode)}`
+          ? `${e.protocol} · ${t(tierLabel[e.trustTier] ?? e.trustTier)} · ${countryName(e.countryCode)}`
           : ''
       }
       foot={

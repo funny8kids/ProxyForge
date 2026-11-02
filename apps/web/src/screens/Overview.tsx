@@ -1,10 +1,10 @@
 import { useMemo } from 'react';
 import { Icon } from '../components/Icon';
-import { AreaChart, Badge, Empty, ErrorNote, Metric, Panel, Progress, Skeleton } from '../components/ui';
+import { AreaChart, Badge, CountryBadge, Empty, ErrorNote, Metric, Panel, Progress, Skeleton } from '../components/ui';
 import { api } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { useI18n } from '../lib/i18n';
-import { compact, countryLabel, ms, pct, tierLabel, tierTone } from '../lib/format';
+import { compact, ms, pct, regionOf, REGION_LABEL, tierLabel, tierTone } from '../lib/format';
 
 /** 展示顺序，不是权限顺序 —— 权限由服务端强制，界面只负责别把颜色排乱 */
 const TIER_RANK: Record<string, number> = {
@@ -212,6 +212,8 @@ export function Overview(): JSX.Element {
         </Panel>
       </div>
 
+      <RegionPanel />
+
       <div className="grid g-2">
         <Panel title={t('Top endpoints')} sub={t('by quality score')} fill>
           <div className="table-wrap">
@@ -229,7 +231,9 @@ export function Overview(): JSX.Element {
                 {(data?.topEndpoints ?? []).map((e) => (
                   <tr key={e.id}>
                     <td className="mono">{e.displayName ?? e.id.slice(0, 8)}</td>
-                    <td>{countryLabel(e.countryCode)}</td>
+                    <td>
+                      <CountryBadge code={e.countryCode} />
+                    </td>
                     <td className="num" style={{ textAlign: 'right' }}>{ms(e.p50Ms)}</td>
                     <td className="num" style={{ textAlign: 'right' }}>{pct(e.successRate24h)}</td>
                     <td style={{ textAlign: 'right' }}>
@@ -327,5 +331,87 @@ export function PageHead({
         </button>
       </div>
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 出口地区分布
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 出口地区分布。
+ *
+ * 这个面板存在的理由：池子里"300 个节点"和"300 个节点分布在 5 个大洲"
+ * 是完全不同的两件事，而计数器面板只能回答前者。免费代理池的地域偏向
+ * 极强（实测北美占六成），不知道这一点就没法解释"为什么连日本网站很慢"。
+ *
+ * 按大洲聚合而不是直接列 51 个国家：那个列表在抽屉里能看，在总览上
+ * 只会变成一屏滚动条，读完还是不知道分布。大洲 5 条能一眼看完。
+ *
+ * 「未知」单独一条，不并进任何大洲：那批节点是还没探出出口 IP 的，
+ * 把它们算进"其他"会让分布看起来比实际更完整。
+ */
+function RegionPanel(): JSX.Element {
+  const { t } = useI18n();
+  const { data, loading } = useAsync(() => api.distribution(), []);
+
+  const items = data?.items ?? [];
+  const total = items.reduce((n, i) => n + i.count, 0);
+  const unknown = items.filter((i) => !i.key).reduce((n, i) => n + i.count, 0);
+
+  const byRegion = new Map<string, number>();
+  for (const it of items) {
+    if (!it.key) continue;
+    const r = regionOf(it.key);
+    byRegion.set(r, (byRegion.get(r) ?? 0) + it.count);
+  }
+  const rows = [...byRegion.entries()].sort((a, b) => b[1] - a[1]);
+  const known = rows.reduce((n, [, c]) => n + c, 0);
+  const peak = Math.max(1, ...rows.map(([, c]) => c));
+
+  return (
+    <Panel
+      title={t('Exit geography')}
+      sub={`${known} / ${total} ${t('with a known exit IP')}`}
+    >
+      {loading && <Skeleton rows={3} />}
+      {!loading && rows.length === 0 && (
+        <div style={{ fontSize: 12, color: 'var(--text-3)', padding: '6px 0' }}>
+          {t('No endpoint has a resolved exit IP yet. Country is filled in on the first successful probe.')}
+        </div>
+      )}
+      <div className="region-bars">
+        {rows.map(([region, count]) => (
+          <div className="region-bar" key={region}>
+            <span className={`country-badge r-${region}`}>
+              <i className="country-dot" aria-hidden />
+              {t(REGION_LABEL[region] ?? 'Other')}
+            </span>
+            <span className="region-track">
+              <i style={{ width: `${(count / peak) * 100}%` }} className={`fill r-${region}`} />
+            </span>
+            <span className="num region-count">{count}</span>
+          </div>
+        ))}
+      </div>
+      {/*
+        「尚未探测」不画进条形图。
+        它不是一个大洲，而且它的量级通常远超任何一洲（本例 4588 vs 最大的 346）——
+        画进去会把所有真实分布压成几条短线，正好毁掉这个面板要回答的问题。
+        单独一行文字，反而让人一眼看出"还有多少没探"。
+      */}
+      {unknown > 0 && (
+        <div className="region-unknown">
+          <span className="country-badge is-unknown">
+            <i className="country-dot" aria-hidden />
+            {t('Not probed yet')}
+          </span>
+          <span className="num">{unknown}</span>
+          <span className="region-unknown-hint">
+            {t('filled in on the first successful probe')}
+          </span>
+        </div>
+      )}
+    </Panel>
   );
 }

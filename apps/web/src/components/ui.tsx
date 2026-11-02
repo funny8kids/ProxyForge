@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 import { Icon } from './Icon';
-import { extent } from '../lib/format';
+import { countryLabel, countryName, extent, regionOf, REGION_LABEL } from '../lib/format';
 
 // ─────────────────────────────────────────────────────────────
 // 面板
@@ -235,6 +235,47 @@ export function Badge({
     <span className={`pill ${PILL_CLASS[tone] ?? 'neutral'}`}>
       {dot && <span className="dot" />}
       {children}
+    </span>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 国家/地区徽章
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 出口地区徽章。
+ *
+ * 纯文字列表读不出分布：300 个节点里"北美 240 / 欧洲 40 / 亚洲 20"
+ * 和"三洲各 100"在表格里长得一模一样，只有滚动到底才发现某一洲根本是空的。
+ * 加一个按大洲着色的色点，扫一眼就能看出这个池子的出口偏向。
+ *
+ * 颜色只用来说明"属于哪一洲"，不带好坏含义 —— 所以没有用 success/danger
+ * 那套语义色，避免让人误以为"红色地区的节点质量差"。
+ *
+ * 没有出口国家时显示 `—` 而不是隐藏：那一列空着会让人以为是渲染 bug，
+ * 而 `—` 配 tooltip 说明"尚未探测出出口 IP"，是一个可解释的状态。
+ */
+export function CountryBadge({
+  code,
+  showName = false,
+}: {
+  code: string | null | undefined;
+  showName?: boolean;
+}): JSX.Element {
+  if (!code) {
+    return (
+      <span className="country-badge is-unknown" title="尚未探测出出口 IP（需要至少一次成功探测）">
+        —
+      </span>
+    );
+  }
+  const region = regionOf(code);
+  const name = countryName(code);
+  return (
+    <span className={`country-badge r-${region}`} title={`${name} · ${REGION_LABEL[region] ?? '其他'}`}>
+      <i className="country-dot" aria-hidden />
+      {showName ? name : countryLabel(code)}
     </span>
   );
 }

@@ -508,6 +508,49 @@
   .pill.neutral{background:var(--ov-3);color:#AEB8C9}
   .pill.plain{background:transparent;box-shadow:inset 0 0 0 1px var(--line-2);color:var(--text-2)}
 
+  /* ── 出口地区徽章 ──────────────────────────────────────────
+     色点只表达"属于哪一洲"，不带好坏语义 —— 所以刻意避开
+     success/danger 那套语义色，否则会让人误读成"红色地区的节点质量差"。
+     色值直接引用主题变量，浅色主题下自动跟随，不需要第二套定义。 */
+  .country-badge{
+    display:inline-flex;align-items:center;gap:5px;
+    font-size:11px;font-weight:500;letter-spacing:.02em;
+    font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--text-2);
+  }
+  .country-badge .country-dot{
+    width:6px;height:6px;border-radius:50%;flex:none;
+    background:var(--ov-6);
+  }
+  .country-badge.r-asia .country-dot{background:var(--cyan)}
+  .country-badge.r-europe .country-dot{background:var(--violet)}
+  .country-badge.r-americas .country-dot{background:var(--success)}
+  .country-badge.r-oceania .country-dot{background:var(--warn)}
+  .country-badge.r-africa .country-dot{background:#C98BD8}
+  .country-badge.r-other .country-dot{background:var(--ov-6)}
+  .country-badge.is-unknown{color:var(--text-3)}
+  /* 表格里色点已经很轻，再叠背景会更花；只在抽屉的 KV 里给一点底色 */
+  .kv .country-badge{height:20px;padding:0 7px;border-radius:5px;background:var(--ov-2)}
+
+  /* ── 地区分布条 ────────────────────────────────────────────
+     三列定宽而不是 flex：数值列宽度固定，条形图才能对齐成一条竖线，
+     否则「亚洲 80」和「大洋洲 3」的条起点会错开，视觉上无法比较长度。 */
+  .region-bars{display:grid;gap:8px;padding:2px 0}
+  .region-bar{display:grid;grid-template-columns:96px minmax(0,1fr) 44px;align-items:center;gap:12px}
+  .region-track{height:6px;border-radius:3px;background:var(--track);overflow:hidden}
+  .region-track i{display:block;height:100%;border-radius:3px;background:var(--ov-6);transition:width .4s var(--ease)}
+  .region-track i.r-asia{background:var(--cyan)}
+  .region-track i.r-europe{background:var(--violet)}
+  .region-track i.r-americas{background:var(--success)}
+  .region-track i.r-oceania{background:var(--warn)}
+  .region-track i.r-africa{background:#C98BD8}
+  .region-count{text-align:right;font-size:11.5px;color:var(--text-2)}
+  .region-bar.is-muted .country-badge{color:var(--text-3)}
+  .region-unknown{
+    display:flex;align-items:center;gap:10px;margin-top:10px;padding-top:9px;
+    border-top:1px solid var(--line);font-size:11.5px;color:var(--text-2);
+  }
+  .region-unknown-hint{color:var(--text-4);font-size:10.5px}
+
   /* ── Chips / filters ──────────────────────────────────────── */
   .filterbar{display:flex;align-items:center;gap:18px;padding:13px 20px;flex-wrap:wrap}
   .fgroup{display:flex;align-items:center;gap:6px}
@@ -845,6 +888,24 @@
   [data-theme="light"] .seg button.on{box-shadow:0 1px 2px rgba(16,24,40,.12),0 0 0 1px var(--line)}
   .seg button svg{width:13px;height:13px}
 
+  /* ── 下拉选择 ──────────────────────────────────────────────
+     和 seg 同一套视觉语言：同高度、同圆角、同底色，
+     这样筛选区里"分段按钮"和"下拉"并排时不会一个高一个低。
+     原生 select 的箭头在各平台差异很大，统一用背景 SVG 覆盖掉。 */
+  .select{
+    height:28px;padding:0 26px 0 10px;border-radius:8px;
+    border:1px solid var(--line);background:var(--ov-2);
+    color:var(--text);font-family:var(--sans);font-size:11.5px;font-weight:500;
+    cursor:pointer;appearance:none;
+    background-image:url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1.2 5 4.8 9 1.2' stroke='%238A94A6' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 9px center;
+    transition:border-color .16s var(--ease),background-color .16s var(--ease);
+  }
+  .select:hover{background-color:var(--ov-3);border-color:var(--line-2)}
+  .select:focus-visible{outline:none;border-color:var(--violet);box-shadow:0 0 0 2px var(--violet-bg)}
+  .select.sm{height:26px;font-size:11px}
+  .select option{background:var(--surface);color:var(--text)}
+
   .cmdk{
     position:fixed;inset:0;z-index:75;display:none;padding-top:13vh;justify-content:center;
     background:var(--scrim);backdrop-filter:blur(8px) saturate(120%);
@@ -1115,6 +1176,21 @@
     font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--text-2);
     word-break:break-all;user-select:all;
   }
+
+  /* ── 可复制的配置片段 ──────────────────────────────────────
+     和 url-box 同源，但保留换行与缩进 —— 粘进 config.yaml 时
+     缩进就是语法，被折叠掉的空白会直接让配置解析失败。 */
+  .snippet-box{display:flex;gap:8px;align-items:flex-start}
+  .snippet-box pre{
+    flex:1;min-width:0;margin:0;padding:10px 12px;border-radius:8px;
+    background:var(--code-bg);box-shadow:inset 0 0 0 1px var(--line-2);
+    font-family:var(--mono);font-size:10.5px;line-height:1.75;color:var(--code-fg);
+    white-space:pre;overflow-x:auto;user-select:all;tab-size:2;
+  }
+  .snippet-box pre .cmt{color:var(--text-3)}
+  .snippet-box pre .key{color:var(--cyan-2)}
+  .snippet-box pre .val{color:var(--violet-2)}
+
   .static-value{
     height:34px;display:flex;align-items:center;padding:0 11px;border-radius:8px;
     background:var(--ov-1);box-shadow:inset 0 0 0 1px var(--line);

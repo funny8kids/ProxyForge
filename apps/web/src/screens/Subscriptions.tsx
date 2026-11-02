@@ -36,6 +36,12 @@ const FORMATS: Array<{ value: string; label: string; client: string; ext: string
     ext: '.yaml',
   },
   {
+    value: 'clash-provider',
+    label: 'Clash proxy-provider',
+    client: '只出节点列表，不覆盖你自己的 dns / rules',
+    ext: '.yaml',
+  },
+  {
     value: 'singbox',
     label: 'sing-box JSON',
     client: 'sing-box core · Clash Verge Rev · FlClash',
@@ -261,7 +267,7 @@ export function Subscriptions(): JSX.Element {  const { t, lang } = useI18n();
             <div className="mono">GET /api/v1/subscriptions/{'{id}'}/export?format=base64</div>
             <div style={{ marginTop: 8 }}>
               {t(
-                'format accepts mihomo / clash / singbox / base64 / plain. Overriding it does not bump the revision.',
+                'format accepts mihomo / clash / clash-provider / singbox / base64 / plain. Overriding it does not bump the revision.',
               )}
             </div>
             <div>
@@ -561,6 +567,7 @@ function SettingsDrawer({
   const [maxLatency, setMaxLatency] = useState(str(sub.nodeFilter.maxLatencyMs));
   const [maxNodes, setMaxNodes] = useState(str(sub.nodeFilter.maxNodes));
   const [excludeHosts, setExcludeHosts] = useState((sub.nodeFilter.excludeHosts ?? []).join(', '));
+  const [countries, setCountries] = useState((sub.nodeFilter.countries ?? []).join(', '));
   const [template, setTemplate] = useState(sub.nameTemplate ?? '');
   const [rules, setRules] = useState(sub.extraRules.join('\n'));
 
@@ -589,6 +596,14 @@ function SettingsDrawer({
     const hosts = excludeHosts.split(/[,\s]+/).map((h) => h.trim()).filter(Boolean);
     if (hosts.length) filter.excludeHosts = hosts;
 
+    // 国家码统一大写并丢掉非两位的项：后端会再归一化一次，但前端先做
+    // 能让"输入 jp 却一条都不出来"这种问题在预览阶段就暴露出来。
+    const cc = countries
+      .split(/[,\s]+/)
+      .map((c) => c.trim().toUpperCase())
+      .filter((c) => /^[A-Z]{2}$/.test(c));
+    if (cc.length) filter.countries = cc;
+
     return {
       nodeFilter: filter,
       nameTemplate: template.trim() || null,
@@ -600,7 +615,7 @@ function SettingsDrawer({
   // 依赖用序列化后的字符串：逐个列出 8 个变量既啰嗦又容易漏，
   // 而漏一个的表现是"改了参数预览不更新"，很难注意到。
   const sig = JSON.stringify([
-    mode, protocols, minQuality, maxLatency, maxNodes, excludeHosts, template, rules,
+    mode, protocols, minQuality, maxLatency, maxNodes, excludeHosts, countries, template, rules,
   ]);
 
   const seq = useRef(0);
@@ -755,8 +770,8 @@ function SettingsDrawer({
               className="input"
               type="number"
               min={1}
-              max={200}
-              placeholder="200"
+              max={500}
+              placeholder="500"
               value={maxNodes}
               onChange={(e) => setMaxNodes(e.target.value)}
             />
@@ -765,6 +780,21 @@ function SettingsDrawer({
         <span className="field-hint" style={{ marginTop: -6 }}>
           {t('Max latency drops nodes that have never been probed — "unknown" is not "fast".')}
         </span>
+
+        <label className="field">
+          <span className="field-label">{t('Only these countries')}</span>
+          <input
+            className="input"
+            placeholder="JP, SG, US"
+            value={countries}
+            onChange={(e) => setCountries(e.target.value)}
+          />
+          <span className="field-hint">
+            {t(
+              'ISO two-letter codes, comma separated. Nodes whose exit country is not yet known are excluded — a guess is not a match.',
+            )}
+          </span>
+        </label>
 
         <label className="field">
           <span className="field-label">{t('Exclude hosts')}</span>
@@ -787,7 +817,9 @@ function SettingsDrawer({
             onChange={(e) => setTemplate(e.target.value)}
           />
           <span className="field-hint">
-            {t('Placeholders: {index} {protocol} {host} {port} {pool}. Duplicates get a suffix.')}
+            {t(
+              'Placeholders: {index} {protocol} {host} {port} {pool} {country}. Duplicates get a suffix.',
+            )}
           </span>
         </label>
 
@@ -953,6 +985,33 @@ function IssuedDrawer({
             </span>
           </label>
 
+          {/*
+            provider 格式和整配置格式的用法完全不同：整配置是"导入即替换"，
+            provider 是"在你自己的 config.yaml 里引用"。只给一条 URL 而不给
+            引用方式，用户拿到一份只有 proxies 的 YAML 会以为导出坏了。
+            所以这里直接给一段能粘进 config.yaml 的最小可用配置。
+          */}
+          {issued.format === 'clash-provider' && (
+            <label className="field">
+              <span className="field-label">{t('Use as proxy-provider')}</span>
+              <div className="snippet-box">
+                <pre>{providerSnippet(issued.url)}</pre>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => copy(providerSnippet(issued.url), 'snippet')}
+                >
+                  <Icon name={copied === 'snippet' ? 'check' : 'download'} size={13} />
+                  {copied === 'snippet' ? t('Copied') : t('Copy')}
+                </button>
+              </div>
+              <span className="field-hint">
+                {t(
+                  'Paste into your own config.yaml. Your DNS and routing rules stay untouched — only the node list is pulled from here.',
+                )}
+              </span>
+            </label>
+          )}
+
           <div className="kv-note">
             <div>
               <span>{t('Default format')}</span>
@@ -1002,6 +1061,41 @@ function IssuedDrawer({
 function absoluteUrl(path: string): string {
   if (/^https?:\/\//.test(path)) return path;
   return `${window.location.origin}${path}`;
+}
+
+/**
+ * 生成可直接粘进 config.yaml 的 provider 引用。
+ *
+ * 刻意给一份**最小可用**的主配置而不是只给 `proxy-providers` 一段：
+ * 用户拿到后者还得自己补 proxy-groups 和 rules，而 mihomo 对
+ * "group 里 use 了一个不存在的 provider" 的报错只有一行
+ * `proxy group not found`，定位不到是哪一步缺了。
+ *
+ * `GEOIP,CN,DIRECT` 放在 MATCH 前面是有意的：这份配置的用途是访问境外服务，
+ * 国内流量走代理只会更慢，而很多人第一次导入时忘了写这条。
+ */
+function providerSnippet(url: string): string {
+  return `proxy-providers:
+  proxyforge:
+    type: http
+    url: "${url}"
+    interval: 3600
+    path: ./providers/proxyforge.yaml
+    health-check:
+      enable: true
+      url: http://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: Proxy
+    type: url-test
+    use: [proxyforge]
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,Proxy`;
 }
 
 /**

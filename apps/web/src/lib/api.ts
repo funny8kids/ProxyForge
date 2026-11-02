@@ -138,6 +138,15 @@ export const api = {
   me: () => get<{ id: string; username: string; role: string; scopes: string[] }>('/auth/me'),
   systemStatus: () => get<SystemStatus & { probeMode: string }>('/system/status'),
   overview: () => get<OverviewAnalytics>('/analytics/overview'),
+  /**
+   * 出口地区分布。
+   *
+   * `key` 为 null 表示"尚未探测出出口 IP"——那批节点不是异常，
+   * 只是还没轮到第一次成功探测。界面要把它们显式画出来，
+   * 否则"已知地区合计 800 / 总数 5000"会看起来像数据丢了。
+   */
+  distribution: () =>
+    get<{ items: Array<{ key: string | null; count: number }> }>('/analytics/distribution'),
 
   resources: (q: string) => get<Page<EndpointSummary>>(`/resources${q ? `?${q}` : ''}`),
   /** 分级探测的到期情况。界面用它回答"为什么这个节点还没被探到"。 */

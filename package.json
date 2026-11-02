@@ -34,7 +34,9 @@
     "test:quality": "node node_modules/tsx/dist/cli.mjs scripts/source-quality.test.mts",
     "test:schedule": "node node_modules/tsx/dist/cli.mjs scripts/probe-schedule.test.mts",
     "test:verify": "node node_modules/tsx/dist/cli.mjs scripts/verification-job.test.mts",
-    "check:subscription": "node scripts/check-subscription.mjs"
+    "check:subscription": "node scripts/check-subscription.mjs",
+    "test:promote": "node node_modules/tsx/dist/cli.mjs scripts/promote-order.test.mts",
+    "diag:cadence": "node node_modules/tsx/dist/cli.mjs scripts/diag-sync-cadence.mts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

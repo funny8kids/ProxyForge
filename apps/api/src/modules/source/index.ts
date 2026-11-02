@@ -215,6 +215,24 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
      * 与 catalog 接口同一套约束：要开自动晋级就必须同时声明授权级别，
      * 系统不替用户编一个 AUTHORIZED 出来。
      */
+    /**
+     * 同步周期的下限。
+     *
+     * 提高同步频率是为了更早拿到新出现的 IP（见 sources-catalog 的说明），
+     * 但这里必须有个地板：`sync_interval_seconds` 是直接拼进
+     * `dueSources` 的时间间隔的，写个 1 会让这个源每 15 秒被拉一次 ——
+     * 那不是"更勤快"，是把对方站点当压测目标，也把我们自己的解析流水线堵死。
+     *
+     * 5 分钟是个保守地板：免费代理列表的换血周期远长于它，
+     * 再快也只能拉到同一份内容（`duplicateSnapshot` 会直接跳过，纯属白拉）。
+     */
+    if (body.syncIntervalSeconds !== undefined && body.syncIntervalSeconds !== null) {
+      const sec = Number(body.syncIntervalSeconds);
+      if (!Number.isInteger(sec) || sec < 300 || sec > 604_800) {
+        throw invalid('syncIntervalSeconds 必须是 300–604800 之间的整数（5 分钟到 7 天）');
+      }
+    }
+
     const autoPromote = body.autoPromote === true;
     const autoAuth = (body.authorization as string | undefined) ?? null;
     if (autoPromote && autoAuth !== 'AUTHORIZED' && autoAuth !== 'RESTRICTED') {

@@ -31,12 +31,39 @@ export async function promoteCandidates(
   const pending = await t.q<{
     id: string; protocol: ProxyProtocol; host: string; port: number; dedupe_key: string | null;
   }>(
+    /**
+     * **最新优先，不是最早优先。**
+     *
+     * 原来是 `ORDER BY created_at ASC`（FIFO），没有任何注释说明为什么 ——
+     * 它只是默认写法。但对免费代理这是反的：候选池的周转时间远长于 IP 的存活期。
+     *
+     * 实测（2026-11，9,442 条待晋级）：中位年龄 **152 分钟**，最老 520 分钟，
+     * 而免费代理 IP 的存活期是几十分钟量级。FIFO 意味着**现在被送进探测器的
+     * 候选，平均已经躺了 2.5 小时** —— 它多半早就不是代理了。
+     *
+     * 同一份数据里按候选年龄分档看「晋级后曾探测成功」的比例：
+     *
+     *   | 候选年龄    | 端点数 | 成功率 |
+     *   |------------|-------|-------|
+     *   | <30 分钟    | 2,098 |  9.3% |
+     *   | 30–60 分钟  |   762 |  4.6% |
+     *   | 1–2 小时    | 5,153 |  5.4% |
+     *   | >2 小时     |18,159 |  3.7% |
+     *
+     * 新鲜候选的产出率是 2.5 倍，而近 3 小时晋级的端点里有 71% 来自最差的
+     * 那一档（>2 小时）。也就是说探测预算的绝大部分花在了已知最不可能活的
+     * 地址上 —— 这不是"源质量差"，是**取数顺序错**。
+     *
+     * 改成 DESC 之后，刚同步进来的候选在下一个周期（15 秒）就能被晋级并立刻
+     * 首探（`hs.last_check_at IS NULL` 立即到期），从"抓到"到"探到"约 1 分钟。
+     * 老候选自然不再被取到，由 `expireStaleCandidates` 按保留期清出队列。
+     */
     `SELECT id, protocol, host, port, dedupe_key
      FROM candidate_endpoints
      WHERE source_id = $1 AND review_status = 'PENDING'
        AND stale_at IS NULL
        AND host IS NOT NULL AND port IS NOT NULL AND protocol IS NOT NULL
-     ORDER BY created_at ASC
+     ORDER BY created_at DESC
      LIMIT $2`,
     [sourceId, limit],
   );
@@ -123,18 +150,28 @@ export async function promoteCandidates(
  * 更实际的影响是它污染排序：`pendingCandidates` 被用作晋级权重，
  * 一个早就被挖空的源靠这个虚高数字能永远排在待挖列表最前面。
  *
- * 保留期 7 天是宽松的：按 400 条/轮、15 秒一轮算，一天能消化两百万条，
- * 五万条积压不到半小时就该轮完一遍。超过 7 天还没被碰过的候选，
- * 只可能是闸门一直关着 —— 那正是该标过期的情形。
+ * ## 保留期从 7 天改成 6 小时
+ *
+ * 7 天这个值是按「一天能消化两百万条」的吞吐算的，算的是**排队时间**，
+ * 没算**值不值得探**。实测按候选年龄看晋级后的探测成功率：
+ * >2 小时的候选只有 3.7%，<30 分钟的有 9.3%。而待晋级队列的中位年龄是
+ * 152 分钟 —— 也就是说队列里绝大多数行早就没有开采价值了，留着它们
+ * 只会让 `pendingCandidates` 这个权重长期虚高。
+ *
+ * 6 小时仍然很宽松：它是同步周期（15 分钟）的 24 倍，足以容忍连续几次同步失败。
+ * 真正的过期判定不该靠这个数字，而该靠晋级顺序（最新优先，见 promoteCandidates）——
+ * 保留期只负责把永远不会被取到的行清出队列。
  */
-export async function expireStaleCandidates(days = 7): Promise<number> {
+const CANDIDATE_STALE_HOURS = Number(process.env.PF_CANDIDATE_STALE_HOURS ?? 6);
+
+export async function expireStaleCandidates(hours = CANDIDATE_STALE_HOURS): Promise<number> {
   return exec(
     `UPDATE candidate_endpoints
         SET stale_at = now()
       WHERE review_status = 'PENDING'
         AND stale_at IS NULL
-        AND created_at < now() - ($1 || ' days')::interval`,
-    [String(days)],
+        AND created_at < now() - ($1 || ' hours')::interval`,
+    [String(hours)],
   );
 }
 

@@ -15,7 +15,31 @@ import type { ProxyProtocol } from '@proxyforge/contracts';
  *
  * 加源只需往 CATALOG 里追加一项，`POST /sources/catalog` 是幂等的
  * （按 key upsert），不会重复插入，也不会覆盖用户改过的信任级与开关。
+ *
+ * ## 同步周期为什么统一压到 15 分钟
+ *
+ * 原来是 30–120 分钟。理由是"内容不会变得那么快"，但这个理由没被验证过，
+ * 而实测是反的：对每个启用源的历史快照统计 content_hash，
+ * **重复率是 0%** —— 每一次同步拿到的都是不同内容（如 hideipme-socks5
+ * 10 次快照 10 个不同 hash，体量在 84–185 条之间来回摆动）。
+ *
+ * 也就是说列表一直在换血，而我们是**欠采样**的：一小时拉一次，就只看到
+ * 换血过程的 1/6，剩下 5/6 出现过的 IP 我们从未见过。免费代理 IP 存活期
+ * 是几十分钟量级，晚 45 分钟看到它，基本等于没看到。
+ *
+ * 代价很小，因为内容没变时同步是**接近零成本**的：`syncSource` 先比对
+ * content_hash，命中就返回 `duplicateSnapshot: true`，不写快照、不解析、
+ * 不产生候选。所以"多拉几次"只在内容真的变了的时候才有实际开销。
+ *
+ * 重复率会上升，但那是**便宜的重复**：重复候选在晋级时被标 DUPLICATE，
+ * 不进探测队列。真正要盯的指标是探测预算的产出率，不是候选表的重复率。
+ *
+ * 下限由 `PATCH /sources/:id` 校验（≥300 秒），避免把周期写成 1 秒
+ * 变成对源站的压测。
  */
+const SYNC_FAST = 900;
+const SYNC_SLOW = 1800;
+
 export interface CatalogEntry {
   key: string;
   name: string;
@@ -40,7 +64,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 48,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '纯 host:port，体量大、更新勤，存活率中等',
   },
   {
@@ -51,7 +75,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS4',
     trustLevel: 45,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '纯 host:port',
   },
   {
@@ -62,7 +86,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 48,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '纯 host:port',
   },
 
@@ -75,7 +99,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 52,
-    syncIntervalSeconds: 1800,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '上游会先做存活检查，条目少但命中率高',
   },
   {
@@ -86,7 +110,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS4',
     trustLevel: 50,
-    syncIntervalSeconds: 1800,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '同上',
   },
   {
@@ -97,7 +121,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 52,
-    syncIntervalSeconds: 1800,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '同上',
   },
 
@@ -110,7 +134,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 40,
-    syncIntervalSeconds: 7200,
+    syncIntervalSeconds: SYNC_SLOW,
     notes: '聚合源，条数多、重复率高，去重后有效占比低',
   },
   {
@@ -121,7 +145,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS4',
     trustLevel: 38,
-    syncIntervalSeconds: 7200,
+    syncIntervalSeconds: SYNC_SLOW,
     notes: '聚合源',
   },
   {
@@ -132,7 +156,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 40,
-    syncIntervalSeconds: 7200,
+    syncIntervalSeconds: SYNC_SLOW,
     notes: '聚合源',
   },
 
@@ -145,7 +169,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 42,
-    syncIntervalSeconds: 7200,
+    syncIntervalSeconds: SYNC_SLOW,
     notes: '更新频率低，条目较少',
   },
   {
@@ -156,7 +180,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 45,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '专做 SOCKS5，体量可观',
   },
   {
@@ -167,7 +191,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 38,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: 'host:port:国家 三段格式，抽取时会丢掉国家标注',
   },
   {
@@ -178,7 +202,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 38,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: 'host:port:国家 三段格式',
   },
 
@@ -211,7 +235,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 40,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '24 条抽样：存活 13（54%）、能建隧道 3（12.5%）。899 条 × 12.5% ≈ 112 个可用隧道/轮，绝对量最大',
   },
   {
@@ -222,7 +246,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 38,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes:
       '⚠ 全量探测 0/107 存活，已停用。24 条抽样曾测到 5 活 1 隧道（4.2%），' +
       '是抽样运气 —— 这也是"小样本别下结论"的实例。保留条目以便日后复查',
@@ -237,7 +261,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 42,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '返回带 scheme 的行，免费额度有速率限制',
   },
   {
@@ -248,7 +272,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 42,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: '同上',
   },
   {
@@ -259,7 +283,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'json',
     protocolHint: 'HTTP',
     trustLevel: 40,
-    syncIntervalSeconds: 3600,
+    syncIntervalSeconds: SYNC_FAST,
     notes: 'JSON，每条带协议数组与国家；单页 500 条',
   },
 
@@ -272,7 +296,7 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'csv',
     protocolHint: 'HTTP',
     trustLevel: 50,
-    syncIntervalSeconds: 1800,
+    syncIntervalSeconds: SYNC_FAST,
     notes: 'socks5://ip:port,US,City 形式，单文件含全部协议，体量最大',
   },
 ];

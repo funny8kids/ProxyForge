@@ -367,7 +367,39 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
       )
     : [];
 
-  const due = [...fresh, ...recheck, ...extraFresh];
+  /**
+   * 还有余量 → 让给「已经到期、但被档位份额挤掉」的端点。
+   *
+   * 前两轮只处理「首次探测」和「份额内的复探」，两者都不足时余量就空着。
+   * 实测这是常态而不是边缘情况：一次批次实际只取到 426 个，而 batch 是 1200 ——
+   * 同时 PENDING_VERIFICATION 有 787 个**已经到期**，却被 15% 的份额卡在 180 个。
+   * 也就是每轮有 65% 的探测预算在空转。
+   *
+   * 这不是"多探一些死节点"的浪费：份额的存在是为了防止某一档饿死别档，
+   * 而这里只在**别的档位都没有需求**时才动用余量，饿死的前提不成立。
+   * 反过来，PENDING 积压正是新候选进不来的原因 ——
+   * 它在 `PF_INGEST_PROBE_BACKLOG` 里占着名额，消化不掉，晋级就停。
+   */
+  const spare2 = batch - fresh.length - recheck.length - extraFresh.length;
+  const overflow = spare2 > 0
+    ? await q<{ id: string }>(
+        `WITH tier(status, minutes, prio, share) AS (
+           VALUES ${TIER_VALUES}
+         )
+         SELECT e.id
+         FROM proxy_endpoints e
+         JOIN tier t ON t.status = e.lifecycle_status::text
+         JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+         WHERE e.deleted_at IS NULL
+           AND hs.last_check_at <= now() - (t.minutes || ' minutes')::interval
+           AND NOT (e.id = ANY($2::uuid[]))
+         ORDER BY t.prio DESC, ${OVERDUE_RATIO} DESC
+         LIMIT $1`,
+        [spare2, [...fresh, ...recheck, ...extraFresh].map((r) => r.id)],
+      )
+    : [];
+
+  const due = [...fresh, ...recheck, ...extraFresh, ...overflow];
 
   if (due.length === 0) return { jobId: null, picked: 0, reason: 'nothing-due' };
 
@@ -431,31 +463,46 @@ export async function reclaimAllRunning(): Promise<number> {
 export async function scheduleBacklog(): Promise<
   Array<{ status: string; intervalMin: number | null; due: number; total: number }>
 > {
-  const rows = await q<{ status: string; due: string; total: string }>(
+  /**
+   * 两条查询，**不能合并成一条**。
+   *
+   * `TIER_VALUES` 来自 `TIER_PLAN`，而 `TIER_PLAN` 里没有 REJECTED / REVOKED
+   * （它们的周期是 null，永不探测，不该参与份额分配）。所以拿 tier 表去 JOIN
+   * 端点会把这两个档位整档过滤掉 —— 接口返回 `REJECTED total=0`，而库里实际
+   * 有 27,583 个。界面上看就像"没有任何节点被判死"，与事实相反。
+   *
+   * 到期数只能靠 tier 表算（要用到 t.minutes），总数不需要，所以分开取。
+   */
+  const dueRows = await q<{ status: string; due: string }>(
     `WITH tier(status, minutes, prio) AS (
        VALUES ${TIER_VALUES}
      )
      SELECT e.lifecycle_status::text AS status,
-            count(*) FILTER (WHERE ${DUE_PREDICATE})::text AS due,
-            count(*)::text AS total
+            count(*) FILTER (WHERE ${DUE_PREDICATE})::text AS due
      FROM proxy_endpoints e
      JOIN tier t ON t.status = e.lifecycle_status::text
      LEFT JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
      WHERE e.deleted_at IS NULL
-     GROUP BY e.lifecycle_status, t.minutes
-     ORDER BY t.minutes`,
+     GROUP BY e.lifecycle_status`,
   );
 
-  const byStatus = new Map(rows.map((r) => [r.status, r]));
-  return Object.entries(TIER_INTERVAL_MIN).map(([status, intervalMin]) => {
-    const r = byStatus.get(status);
-    return {
-      status,
-      intervalMin,
-      due: Number(r?.due ?? 0),
-      total: Number(r?.total ?? 0),
-    };
-  });
+  const totalRows = await q<{ status: string; total: string }>(
+    `SELECT lifecycle_status::text AS status, count(*)::text AS total
+     FROM proxy_endpoints
+     WHERE deleted_at IS NULL
+     GROUP BY lifecycle_status`,
+  );
+
+  const dueByStatus = new Map(dueRows.map((r) => [r.status, r.due]));
+  const totalByStatus = new Map(totalRows.map((r) => [r.status, r.total]));
+
+  return Object.entries(TIER_INTERVAL_MIN).map(([status, intervalMin]) => ({
+    status,
+    intervalMin,
+    // 周期为 null 的档位（REJECTED / REVOKED）永远不到期，到期数恒为 0
+    due: intervalMin === null ? 0 : Number(dueByStatus.get(status) ?? 0),
+    total: Number(totalByStatus.get(status) ?? 0),
+  }));
 }
 
 /** 清理遗留的调度任务记录，避免 verification_jobs 无限增长 */

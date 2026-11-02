@@ -481,6 +481,26 @@ await check('已软删除的端点不入队', async () => {
 
 console.log('\n[7] 到期统计');
 
+await check('到期数被份额挤掉时，余量让给超期最狠的端点（不让预算空转）', async () => {
+  // 实测形态：batch 1200，一次实际只取到 426 个，而 PENDING_VERIFICATION
+  // 有 787 个**已经到期**、却被 15% 的份额卡在 180 个 —— 每轮 65% 预算空转。
+  //
+  // 份额的作用是防止某一档饿死别档。这里只在别档都没需求时才动用余量，
+  // 所以"饿死"的前提不成立，填满批次是纯收益。
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  // 清一色 PENDING_VERIFICATION，且全部远超 30 分钟周期 → 都到期，
+  // 但 share=15% 只放行一小部分
+  for (let i = 0; i < 40; i += 1) await mkEndpoint('PENDING_VERIFICATION', 9999);
+  const r = await enqueueDueProbes(20);
+  assert.equal(
+    (await jobEndpointIds(r.jobId!)).length,
+    20,
+    '其余档位都没需求时，批次必须被超期的 PENDING 填满，而不是只给 15% 份额',
+  );
+  await clearSchedulerJobs();
+});
+
 await check('scheduleBacklog 覆盖全部档位，且 due ≤ total', async () => {
   const tiers = await scheduleBacklog();
   assert.ok(tiers.length >= 7);
@@ -497,6 +517,25 @@ await check('scheduleBacklog 覆盖全部档位，且 due ≤ total', async () =
     healthy?.intervalMin !== null && (healthy?.intervalMin ?? 0) > 0 && (healthy?.intervalMin ?? 0) <= 60,
     `HEALTHY 复探周期 ${healthy?.intervalMin} 分钟太长，订阅会发陈旧快照`,
   );
+});
+
+await check('scheduleBacklog 要把 REJECTED / REVOKED 的总数算进去（到期恒为 0）', async () => {
+  // 这两个档位的周期是 null，不参与份额分配，所以 TIER_PLAN 里没有它们。
+  // 早期实现拿 tier 表去 JOIN 端点，于是整档被过滤掉 —— 接口返回
+  // `REJECTED total=0`，而库里实际有 27,583 个。界面上看就像
+  // "没有任何节点被判死"，与事实相反，且会让人误判淘汰是否在工作。
+  await settleAllEndpoints();
+  for (let i = 0; i < 3; i += 1) await mkEndpoint('REJECTED', 99999);
+  for (let i = 0; i < 2; i += 1) await mkEndpoint('REVOKED', 99999);
+
+  const tiers = await scheduleBacklog();
+  const rejected = tiers.find((t) => t.status === 'REJECTED');
+  const revoked = tiers.find((t) => t.status === 'REVOKED');
+
+  assert.ok((rejected?.total ?? 0) >= 3, `REJECTED total 应 ≥3，实际 ${rejected?.total}`);
+  assert.ok((revoked?.total ?? 0) >= 2, `REVOKED total 应 ≥2，实际 ${revoked?.total}`);
+  assert.equal(rejected?.due, 0, '永不探测的档位到期数必须是 0');
+  assert.equal(revoked?.due, 0);
 });
 
 await closeDb();

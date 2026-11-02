@@ -175,62 +175,19 @@ async function negotiate(
   timeoutMs: number,
 ): Promise<Negotiation> {
   try {
-    if (target.protocol === 'SOCKS5' || target.protocol === 'SOCKS4') {
-      const greeting = target.protocol === 'SOCKS5' ? await socks5Handshake(socket, target, timeoutMs) : null;
+    if (target.protocol === 'SOCKS5') {
+      const greeting = await socks5Handshake(socket, target, timeoutMs);
       if (greeting && !greeting.ok) return greeting;
-    } else {
-      // HTTP / HTTPS_CONNECT：发 CONNECT
-      const head = [
-        `CONNECT ip-api.com:80 HTTP/1.1`,
-        `Host: ip-api.com:80`,
-        `Proxy-Connection: keep-alive`,
-      ];
-      // 需要认证的 HTTP 代理不带头会直接回 407，看起来像"协议错误"，
-      // 排障时会被误判成代理不支持 CONNECT。
-      if (target.username) {
-        const token = Buffer.from(`${target.username}:${target.password ?? ''}`, 'utf8').toString('base64');
-        head.push(`Proxy-Authorization: Basic ${token}`);
-      }
-      const req = [...head, '', ''].join('\r\n');
-      socket.write(req);
-      const resp = await readSome(socket, timeoutMs);
-      if (!/^HTTP\/1\.[01] 200/.test(resp)) {
-        return {
-          ok: false,
-          reason: /407/.test(resp) ? 'AUTH_FAILED' : 'PROTOCOL_ERROR',
-          detail: resp.slice(0, 160) || 'CONNECT 无响应',
-          exitIp: null,
-          exitCountry: null,
-        };
-      }
+      return await requestExitIp(socket, timeoutMs);
+    }
+    if (target.protocol === 'SOCKS4') {
+      const greeting = await socks4Handshake(socket, target, timeoutMs);
+      if (!greeting.ok) return greeting;
+      return await requestExitIp(socket, timeoutMs);
     }
 
-    // 隧道已建立，发一个最简 GET 取出口 IP
-    const get = [
-      'GET /json HTTP/1.1',
-      'Host: ip-api.com',
-      'User-Agent: ProxyForge-Probe/1.0',
-      'Connection: close',
-      '',
-      '',
-    ].join('\r\n');
-    socket.write(get);
-    const body = await readSome(socket, timeoutMs);
-    const jsonStart = body.indexOf('{');
-    if (jsonStart < 0) {
-      return { ok: false, reason: 'PROTOCOL_ERROR', detail: '出口探测无 JSON 响应', exitIp: null, exitCountry: null };
-    }
-    const parsed = JSON.parse(body.slice(jsonStart, body.lastIndexOf('}') + 1)) as {
-      query?: string;
-      countryCode?: string;
-    };
-    return {
-      ok: true,
-      reason: 'NONE',
-      detail: null,
-      exitIp: parsed.query ?? null,
-      exitCountry: parsed.countryCode ?? null,
-    };
+    // HTTP / HTTPS_CONNECT
+    return await httpProxyProbe(socket, target, timeoutMs);
   } catch (err) {
     return {
       ok: false,
@@ -240,6 +197,151 @@ async function negotiate(
       exitCountry: null,
     };
   }
+}
+
+/**
+ * HTTP 代理探活：一次绝对 URI 往返。
+ *
+ * 为什么不用 CONNECT（早期实现就是这么写的，两个问题）：
+ *
+ *   1. **假阴性**。CONNECT 测的是隧道能力，而相当一部分免费 HTTP 代理
+ *      只做正向代理转发、不支持 CONNECT。用 CONNECT 探会把它们全判死，
+ *      可它们在 Clash 里对 http:// 站点依然是能用的。
+ *   2. **慢一倍**。CONNECT 成功之后隧道保持打开，读响应只能等超时；
+ *      再来一次 GET 才是第二次往返。绝对 URI 一次就拿到出口 IP。
+ *
+ * 代价是没测隧道能力。这个取舍是刻意的：先把"这个代理到底通不通"
+ * 判准，比在同一个布尔值里混两个语义更重要。
+ */
+async function httpProxyProbe(
+  socket: Socket,
+  target: ProbeTarget,
+  timeoutMs: number,
+): Promise<Negotiation> {
+  const lines = [
+    'GET http://ip-api.com/json HTTP/1.1',
+    'Host: ip-api.com',
+    'User-Agent: ProxyForge-Probe/1.0',
+    'Accept: application/json',
+    'Connection: close',
+  ];
+  // 需要认证的代理不带头会直接回 407，看起来像"协议错误"，
+  // 排障时会被误判成代理不支持转发。
+  if (target.username) {
+    const token = Buffer.from(`${target.username}:${target.password ?? ''}`, 'utf8').toString('base64');
+    lines.push(`Proxy-Authorization: Basic ${token}`);
+  }
+  socket.write([...lines, '', ''].join('\r\n'));
+
+  const raw = await readUntil(socket, timeoutMs, (s) => s.includes('\r\n\r\n') && s.includes('}'));
+  const head = raw.slice(0, Math.max(0, raw.indexOf('\r\n\r\n')));
+  const status = /^HTTP\/1\.[01]\s+(\d{3})/.exec(head)?.[1];
+
+  if (status === '407') {
+    return { ok: false, reason: 'AUTH_FAILED', detail: head.slice(0, 160), exitIp: null, exitCountry: null };
+  }
+  if (status !== '200') {
+    return {
+      ok: false,
+      reason: 'PROTOCOL_ERROR',
+      detail: head.slice(0, 160) || '代理无响应',
+      exitIp: null,
+      exitCountry: null,
+    };
+  }
+
+  return parseExitIp(raw);
+}
+
+/** 从响应里抠出出口 IP。抽出来是因为三种协议都要走这一段。 */
+function parseExitIp(raw: string): Negotiation {
+  const jsonStart = raw.indexOf('{');
+  const jsonEnd = raw.lastIndexOf('}');
+  if (jsonStart < 0 || jsonEnd <= jsonStart) {
+    return { ok: false, reason: 'PROTOCOL_ERROR', detail: '出口探测无 JSON 响应', exitIp: null, exitCountry: null };
+  }
+  let parsed: { query?: string; countryCode?: string };
+  try {
+    parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1)) as { query?: string; countryCode?: string };
+  } catch {
+    return { ok: false, reason: 'PROTOCOL_ERROR', detail: '出口探测响应不是合法 JSON', exitIp: null, exitCountry: null };
+  }
+  return {
+    ok: true,
+    reason: 'NONE',
+    detail: null,
+    exitIp: parsed.query ?? null,
+    exitCountry: parsed.countryCode ?? null,
+  };
+}
+
+/** 隧道已建立（SOCKS）后，在隧道内发一次普通请求取出口 IP。 */
+async function requestExitIp(socket: Socket, timeoutMs: number): Promise<Negotiation> {
+  const get = [
+    'GET /json HTTP/1.1',
+    'Host: ip-api.com',
+    'User-Agent: ProxyForge-Probe/1.0',
+    'Accept: application/json',
+    'Connection: close',
+    '',
+    '',
+  ].join('\r\n');
+  socket.write(get);
+  const raw = await readUntil(socket, timeoutMs, (s) => s.includes('}'));
+  const status = /^HTTP\/1\.[01]\s+(\d{3})/.exec(raw)?.[1];
+  if (status && status !== '200') {
+    return { ok: false, reason: 'PROTOCOL_ERROR', detail: raw.slice(0, 160), exitIp: null, exitCountry: null };
+  }
+  return parseExitIp(raw);
+}
+
+/**
+ * SOCKS4 / SOCKS4a 握手。
+ *
+ * 早期版本没有这段：`negotiate` 只对 SOCKS5 走握手，SOCKS4 直接落到裸 GET，
+ * 于是全部 SOCKS4 端点必然失败 —— 那 4,516 条候选不管死活都会被判死。
+ * 这种"某一类协议整体 0 存活"的结果看起来像数据质量问题，实际是探针缺失。
+ *
+ * 这里发 SOCKS4a 请求（DSTIP=0.0.0.1，域名跟在末尾），
+ * 好处是不必在本地先把目标域名解析成 IPv4 —— 让代理自己去解析，
+ * 也顺便避免本地 DNS 结果与代理侧出口不一致造成的假阴性。
+ */
+function socks4Handshake(
+  socket: Socket,
+  target: ProbeTarget,
+  timeoutMs: number,
+): Promise<Negotiation> {
+  const host = 'ip-api.com';
+  const port = 80;
+  const user = Buffer.from(target.username ?? '', 'utf8');
+  const req = Buffer.concat([
+    Buffer.from([0x04, 0x01]), // VN=4, CD=1 CONNECT
+    Buffer.from([port >> 8, port & 0xff]),
+    Buffer.from([0x00, 0x00, 0x00, 0x01]), // SOCKS4a：无效 IP，域名在后面
+    user,
+    Buffer.from([0x00]),
+    Buffer.from(host, 'utf8'),
+    Buffer.from([0x00]),
+  ]);
+  socket.write(req);
+
+  return readBytes(socket, 8, timeoutMs).then((reply) => {
+    if (!reply) {
+      return { ok: false, reason: 'TIMEOUT' as CheckFailureReason, detail: 'SOCKS4 握手无响应', exitIp: null, exitCountry: null };
+    }
+    // 第二字节 0x5a = granted，0x5b = rejected
+    const code = reply[1] ?? 0xff;
+    if (code === 0x5a) {
+      return { ok: true, reason: 'NONE' as CheckFailureReason, detail: null, exitIp: null, exitCountry: null };
+    }
+    return {
+      ok: false,
+      reason: (code === 0x5b ? 'PROTOCOL_ERROR' : 'AUTH_FAILED') as CheckFailureReason,
+      detail: `SOCKS4 CONNECT 被拒 code=0x${code.toString(16)}`,
+      exitIp: null,
+      exitCountry: null,
+    };
+  });
 }
 
 async function socks5Handshake(
@@ -309,45 +411,65 @@ async function socks5Handshake(
   return null; // 成功，继续走通用 GET
 }
 
-function readSome(socket: Socket, timeoutMs: number): Promise<string> {
+/**
+ * 读到"够了"为止。
+ *
+ * 判定条件由调用方给：HTTP 要等响应头和 JSON 都到齐，隧道内的 GET 只要 JSON。
+ * 早期版本硬编码"包含 } 就算完"，对 CONNECT 响应永远不成立 ——
+ * 于是每一次成功的 CONNECT 都要白等满超时才继续，
+ * 单次探测从 100ms 变成 4s，直接把探测吞吐砍掉一个数量级。
+ *
+ * 两个监听器都在落定时摘掉：探针是高频调用的，泄漏的 'close' 监听
+ * 会让同一个 socket 上堆积几十个回调，最终触发 MaxListenersExceededWarning。
+ */
+function readUntil(
+  socket: Socket,
+  timeoutMs: number,
+  done: (raw: string) => boolean,
+): Promise<string> {
   return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    const timer = setTimeout(() => {
+    let buf = '';
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.off('data', onData);
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    }, timeoutMs);
-    const onData = (c: Buffer) => {
-      chunks.push(c);
-      if (Buffer.concat(chunks).toString('utf8').includes('}')) {
-        clearTimeout(timer);
-        socket.off('data', onData);
-        resolve(Buffer.concat(chunks).toString('utf8'));
-      }
+      socket.off('close', finish);
+      socket.off('error', finish);
+      resolve(buf);
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const onData = (c: Buffer): void => {
+      buf += c.toString('utf8');
+      if (done(buf)) finish();
     };
     socket.on('data', onData);
-    socket.once('close', () => {
-      clearTimeout(timer);
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    });
+    socket.once('close', finish);
+    socket.once('error', finish);
   });
 }
 
 function readBytes(socket: Socket, n: number, timeoutMs: number): Promise<Buffer | null> {
   return new Promise((resolve) => {
     let buf = Buffer.alloc(0);
-    const timer = setTimeout(() => {
+    let settled = false;
+    const finish = (v: Buffer | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.off('data', onData);
-      resolve(null);
-    }, timeoutMs);
-    const onData = (c: Buffer) => {
-      buf = Buffer.concat([buf, c]);
-      if (buf.length >= n) {
-        clearTimeout(timer);
-        socket.off('data', onData);
-        resolve(buf.subarray(0, n));
-      }
+      socket.off('close', onClose);
+      resolve(v);
     };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const onData = (c: Buffer): void => {
+      buf = Buffer.concat([buf, c]);
+      if (buf.length >= n) finish(buf.subarray(0, n));
+    };
+    const onClose = (): void => finish(buf.length >= n ? buf.subarray(0, n) : null);
     socket.on('data', onData);
+    socket.once('close', onClose);
   });
 }
 

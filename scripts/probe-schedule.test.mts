@@ -70,6 +70,26 @@ async function clearSchedulerJobs(): Promise<void> {
   );
 }
 
+/**
+ * 把库里所有端点都置为"刚探过"。
+ *
+ * 后面几段测试关心的是排序与预算，前提是"没有别的端点抢在前面"。
+ * 而"从没探过"的端点按设计会永远排在最前 —— 所以这里必须把
+ * 还没有 health_state 行的端点也补一行，否则上一段留下的未探端点
+ * 会一直插队，让后面的断言测的其实是它。
+ */
+async function settleAllEndpoints(): Promise<void> {
+  await exec(
+    `INSERT INTO endpoint_health_state (endpoint_id, last_check_at)
+     SELECT e.id, now() FROM proxy_endpoints e
+     WHERE NOT EXISTS (
+       SELECT 1 FROM endpoint_health_state s WHERE s.endpoint_id = e.id
+     )
+     ON CONFLICT DO NOTHING`,
+  );
+  await exec(`UPDATE endpoint_health_state SET last_check_at = now()`);
+}
+
 async function jobEndpointIds(jobId: string): Promise<string[]> {
   const row = await q1<{ endpoint_ids: string[] }>(
     'SELECT endpoint_ids FROM verification_jobs WHERE id = $1',
@@ -88,8 +108,35 @@ await check('全部刚探过 → nothing-due，不创建任务', async () => {
   assert.equal(r.reason, 'nothing-due');
 });
 
-console.log('\n[2] 到期入队');
+console.log('\n[1b] 首次探测不该等满间隔');
 
+await check('从没探过的端点立刻到期，不用等满该档间隔', async () => {
+  // 晋级出来的端点只有 created_at，没有 last_check_at。
+  // 早期版本用 `COALESCE(last_check_at, created_at) <= now() - interval` 判定到期，
+  // 于是刚晋级的端点要干等 10 分钟才轮到第一次探测 ——
+  // 现场表现是"晋级了 400 个，探测队列 due 恒为 0，界面一动不动"，
+  // 而日志里一切正常，只有数字全是零。档位里的分钟数是**复探**间隔，
+  // 不该管首次探测。
+  const id = await mkEndpoint('PENDING_VERIFICATION', null);
+  const r = await enqueueDueProbes();
+  assert.ok(r.jobId, '从没探过的端点应该立刻入队');
+  assert.ok((await jobEndpointIds(r.jobId!)).includes(id));
+  await clearSchedulerJobs();
+});
+
+await check('到期统计与入队判定一致', async () => {
+  // 这两处曾经各写一份 SQL：界面按新间隔算 due，调度器按旧间隔入队，
+  // 两边都不报错，只是数字对不上。现在共用 DUE_PREDICATE，断言它们同口径。
+  const id = await mkEndpoint('PENDING_VERIFICATION', null);
+  const pending = (await scheduleBacklog()).find((t) => t.status === 'PENDING_VERIFICATION');
+  assert.ok((pending?.due ?? 0) >= 1, '界面必须能看见这个端点是到期的');
+
+  const r = await enqueueDueProbes();
+  assert.ok((await jobEndpointIds(r.jobId!)).includes(id), '界面说到期，调度器就必须入队');
+  await clearSchedulerJobs();
+});
+
+console.log('\n[2] 到期入队');
 await check('HEALTHY 超过 6 小时 → 入队', async () => {
   const id = await mkEndpoint('HEALTHY', 400);
   const r = await enqueueDueProbes();
@@ -112,7 +159,7 @@ console.log('\n[3] 排序：超期倍数优先');
 
 await check('HEALTHY 超期 10 倍 排在 DISCOVERED 超期 1.1 倍 之前', async () => {
   // 清空可调度范围，只留这两个
-  await exec(`UPDATE endpoint_health_state SET last_check_at = now()`);
+  await settleAllEndpoints();
   const healthy = await mkEndpoint('HEALTHY', 3600);   // 360 分钟周期，超期 10 倍
   const fresh = await mkEndpoint('DISCOVERED', 11);    // 10 分钟周期，超期 1.1 倍
   const r = await enqueueDueProbes();
@@ -122,9 +169,39 @@ await check('HEALTHY 超期 10 倍 排在 DISCOVERED 超期 1.1 倍 之前', asy
   await clearSchedulerJobs();
 });
 
-console.log('\n[4] 预算上限');
+console.log('\n[3b] 首次探测与复探都不许饿死');
 
+await check('新端点积压时，复探仍能进入批次', async () => {
+  // 曾经的排序把"从没探过"放在绝对最前，于是只要有几十个新端点待探，
+  // 复探永远轮不上。后果不是"慢"，而是**生命周期冻结**：
+  // VERIFIED 等不到第二次确认 → HEALTHY 恒为 0 → 池子空 → 订阅空；
+  // PENDING 凑不满连续失败 → REJECTED 永远不出现 → 死节点永不退出探测。
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  for (let i = 0; i < 50; i += 1) await mkEndpoint('PENDING_VERIFICATION', null);
+  const verified = await mkEndpoint('VERIFIED', 20); // 15 分钟周期，已超期
+  const r = await enqueueDueProbes(10);
+  const ids = await jobEndpointIds(r.jobId!);
+  assert.ok(ids.includes(verified), '复探必须分到配额，否则生命周期永远不推进');
+  await clearSchedulerJobs();
+});
+
+await check('复探不足时，余量让给首次探测', async () => {
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  for (let i = 0; i < 10; i += 1) await mkEndpoint('PENDING_VERIFICATION', null);
+  const r = await enqueueDueProbes(6);
+  assert.equal(
+    (await jobEndpointIds(r.jobId!)).length,
+    6,
+    '没有复探可做时批次必须用满，不能只入一半',
+  );
+  await clearSchedulerJobs();
+});
+
+console.log('\n[4] 预算上限');
 await check('batch 参数限制单次入队数量', async () => {
+  await settleAllEndpoints();
   await exec(`UPDATE endpoint_health_state SET last_check_at = now() - interval '10 hours'`);
   for (let i = 0; i < 12; i += 1) await mkEndpoint('HEALTHY', 600);
   const r = await enqueueDueProbes(5);

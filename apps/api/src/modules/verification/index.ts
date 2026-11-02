@@ -175,7 +175,20 @@ export async function runVerificationJob(jobId: string): Promise<void> {
   let completed = 0;
   let failedCount = 0;
 
-  await runPool(targets, 8, async (t) => {
+  /**
+   * 探测并发。
+   *
+   * 原来是写死的 8 —— 对自有资源够用（几十个节点），但对免费公开代理
+   * 完全不成立：一次同步进来几千个候选，20% 存活率，8 并发 × 4 秒超时
+   * 等于每秒 2 个，探完一轮要几十分钟，而那一轮里最早的结论已经过期。
+   *
+   * 默认 24：免费代理大多是「要么秒连、要么直接超时」，24 路并发在
+   * 家用带宽上不会打满，但把吞吐提到每秒 6 个。上限 64 —— 再高就变成
+   * 对别人服务器的小型扫描，既不礼貌也不安全。
+   */
+  const concurrency = Math.min(Math.max(Number(process.env.PF_PROBE_CONCURRENCY ?? 24), 1), 64);
+
+  await runPool(targets, concurrency, async (t) => {
     const result =
       PROBE_MODE === 'fixture'
         ? fixtureProbe(t.dedupe_key)
@@ -280,8 +293,8 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
     );
 
     // 生命周期推进：连续失败 3 次才降级，避免抖动误伤
-    const cur = await t.q1<{ lifecycle_status: string }>(
-      'SELECT lifecycle_status FROM proxy_endpoints WHERE id = $1',
+    const cur = await t.q1<{ lifecycle_status: string; trust_tier: string }>(
+      'SELECT lifecycle_status, trust_tier FROM proxy_endpoints WHERE id = $1',
       [endpointId],
     );
     let next: string | null = null;
@@ -295,6 +308,26 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
       if (cur?.lifecycle_status === 'VERIFIED' && cs >= 2) next = 'HEALTHY';
     } else if (cf >= 3) {
       next = 'UNAVAILABLE';
+    }
+
+    // 免费公开代理要能被判死，否则探测预算会被死节点永久吃掉。
+    //
+    // 实测免费代理存活率约 20%，且掉线基本是永久的（列表里的 IP 换了人）。
+    // 只降级到 UNAVAILABLE 的话，它按 120 分钟一轮被永远重探 ——
+    // 攒到几千个死节点时，一半的探测容量都在给已经不存在的东西做体检。
+    // REJECTED 在调度表里是 null 间隔，等于彻底退出探测。
+    //
+    // 判死条件刻意收得很窄：**连续 3 次失败 + 从未成功过一次**。
+    // 也就是"从出生就是死的"那一类 —— 免费列表里占大多数。
+    // 不用固定次数阈值：一个活过的节点（last_success_at 非空）掉线后
+    // 仍可能回来，那种留在 UNAVAILABLE 按 120 分钟复核就够了。
+    //
+    // 只对 PUBLIC_PROXY 生效：自有/私有资源的不可用可能是对方在维护，
+    // 自动判死会让人在恢复后还得手工捞回来，那是帮倒忙。
+    if (
+      !r.success && cf >= 3 && !prev?.last_success_at && cur?.trust_tier === 'PUBLIC_PROXY'
+    ) {
+      next = 'REJECTED';
     }
 
     if (next && next !== cur?.lifecycle_status) {

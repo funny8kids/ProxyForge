@@ -33,7 +33,11 @@ export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   PENDING_VERIFICATION: 10,
   // 已经在坏，随时会掉 —— 这是最需要盯的一档
   DEGRADED: 30,
-  VERIFIED: 120,
+  // 过了第一次探测、还差一次连续成功才算 HEALTHY。
+  // 这一档的**唯一**用途就是尽快凑出第二次确认，所以必须短：
+  // 给 120 分钟的话，节点导入后两小时内一个都不会变成 HEALTHY，
+  // 而订阅只收 HEALTHY/DEGRADED —— 等于导入当天完全不可用。
+  VERIFIED: 15,
   UNAVAILABLE: 120,
   // 已经能用，探它只是确认还活着
   HEALTHY: 360,
@@ -44,14 +48,40 @@ export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   REVOKED: null,
 };
 
+/** 档位优先级：数字大的先探。新候选最急，隔离的只做低频复查。 */
+const TIER_PRIO: Record<string, number> = {
+  DISCOVERED: 90,
+  PENDING_VERIFICATION: 90,
+  DEGRADED: 70,
+  VERIFIED: 50,
+  UNAVAILABLE: 40,
+  HEALTHY: 20,
+  QUARANTINED: 10,
+};
+
+/**
+ * 把档位表编译成 SQL VALUES。
+ *
+ * 之前这段 SQL 是手写的字面量，于是"改了 TIER_INTERVAL_MIN 但忘了改 SQL"
+ * 会静默生效于一半代码路径：界面按新间隔算 due，调度器按旧间隔入队。
+ * 两边都不报错，只是数字对不上。让它从同一份常量生成，这类分叉就不可能发生。
+ */
+const TIER_VALUES = Object.keys(TIER_PRIO)
+  .map((s) => `('${s}',${TIER_INTERVAL_MIN[s]},${TIER_PRIO[s]})`)
+  .join(', ');
+
 /**
  * 每 tick 的探测预算。
  *
- * 60 个 × 并发 8 × 4 秒超时 ≈ 最坏 30 秒，比 15 秒的调度周期长 ——
- * 所以下面用"已有在跑的调度任务就不再入队"来防止堆积，
- * 而不是靠调小预算。探测是慢操作，让 tick 等它才是错的做法。
+ * 120 个 × 并发 48 × 4 秒超时 ≈ 最坏 10 秒，仍在 15 秒的调度周期之内；
+ * 但死代理多半是连接被拒（毫秒级返回），实际远快于最坏值。
+ * 下面仍然用"已有在跑的调度任务就不再入队"来防止堆积 ——
+ * 探测是慢操作，让 tick 等它才是错的做法。
+ *
+ * 预算要跟并发一起调：只加预算不加并发，批次跑不完就会被 busy 守卫跳过，
+ * 实际吞吐反而不变。这两个数是一组。
  */
-const DEFAULT_BATCH = 60;
+const DEFAULT_BATCH = Number(process.env.PF_PROBE_BATCH ?? 120);
 
 export interface EnqueueResult {
   jobId: string | null;
@@ -61,6 +91,54 @@ export interface EnqueueResult {
 
 /** 调度器创建的任务用 filter 打标记，便于"是否有任务在跑"的判断与审计 */
 const SCHEDULER_MARK = `'{"source":"scheduler"}'::jsonb`;
+
+/**
+ * 「这一档该探了」的判定。要求查询里有 `e`（端点）与 `hs`（健康态）两个别名，
+ * 以及带 `minutes` 列的 `t`。
+ *
+ * 这是"到期"的**定义**，给界面统计用；入队查询按 FRESH_SHARE 拆成
+ * "从没探过"和"该复探"两半，合起来正好是这里的并集。
+ * 两边必须同口径：分别写的话很容易一边改了另一边没改，
+ * 结果界面显示"0 个到期"而调度器实际入了 60 个。
+ *
+ * 关键点：从没探测过的端点立刻算到期。
+ * tier 里的分钟数是**复探**间隔（探过之后隔多久再探），
+ * 早期版本用 `COALESCE(last_check_at, created_at) <= now() - interval`
+ * 把这个间隔也套在了首次探测上 —— 于是新晋级的端点要干等 10 分钟才轮到第一次体检，
+ * 表现为"晋级了 400 个，探测队列 due=0，界面一动不动"。
+ */
+const DUE_PREDICATE = `(
+  hs.last_check_at IS NULL
+  OR hs.last_check_at <= now() - (t.minutes || ' minutes')::interval
+)`;
+
+/**
+ * 首次探测与复探的配额比例。
+ *
+ * 为什么需要配额，而不是靠一条 ORDER BY 排完：
+ *
+ *   把"从没探过"排在绝对最前 → 复探被饿死。只要有 60 个新端点待探，
+ *   任何复探都轮不上，于是 VERIFIED 永远等不到第二次确认、
+ *   PENDING_VERIFICATION 永远凑不满 3 次失败、REJECTED 永远不会出现。
+ *   现场表现是 `VERIFIED due` 恒为 0，健康节点数永远是 0。
+ *
+ *   反过来把"超期倍数"排在最前 → 新端点被饿死。复探积压一旦形成，
+ *   新晋级的端点永远排在后面，晋级了但没人探。
+ *
+ * 两边都可能饿死，所以这里显式切预算：一半给新端点，一半给复探。
+ * 某一侧不足时余量让给另一侧（见 enqueueDueProbes），保证批次用满。
+ */
+const FRESH_SHARE = 0.5;
+
+/**
+ * 复探排序：按"超期倍数"。
+ *
+ * 超期倍数而不是绝对时间：一个健康节点 6 小时该复核、一个降级节点 30 分钟该复核，
+ * 后者超期 30 分钟比前者超期 1 小时更急。用绝对时间排序会让慢档位永远排不上。
+ */
+const OVERDUE_ORDER = `
+  EXTRACT(EPOCH FROM (now() - hs.last_check_at)) / (t.minutes * 60) DESC,
+  t.prio DESC`;
 
 /**
  * 回收僵死任务。
@@ -100,24 +178,64 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
   );
   if (busy.length > 0) return { jobId: null, picked: 0, reason: 'busy' };
 
-  const due = await q<{ id: string }>(
+  // 首次探测与复探分开取，各自有配额 —— 详见 FRESH_SHARE 的注释。
+  const freshQuota = Math.max(1, Math.ceil(batch * FRESH_SHARE));
+
+  const fresh = await q<{ id: string }>(
     `WITH tier(status, minutes, prio) AS (
-       VALUES ('DISCOVERED',10,90), ('PENDING_VERIFICATION',10,90),
-              ('DEGRADED',30,70), ('VERIFIED',120,50), ('UNAVAILABLE',120,40),
-              ('HEALTHY',360,20), ('QUARANTINED',720,10)
+       VALUES ${TIER_VALUES}
      )
      SELECT e.id
      FROM proxy_endpoints e
      JOIN tier t ON t.status = e.lifecycle_status::text
      LEFT JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
      WHERE e.deleted_at IS NULL
-       AND COALESCE(hs.last_check_at, e.created_at) <= now() - (t.minutes || ' minutes')::interval
-     ORDER BY EXTRACT(EPOCH FROM (now() - COALESCE(hs.last_check_at, e.created_at)))
-                / (t.minutes * 60) DESC,
-              t.prio DESC
+       AND hs.last_check_at IS NULL
+     ORDER BY t.prio DESC, e.created_at ASC
      LIMIT $1`,
-    [batch],
+    [freshQuota],
   );
+
+  // 复探配额 = 剩余额度。首次探测不足时，余量全部让给复探。
+  const recheckQuota = batch - fresh.length;
+  const recheck = recheckQuota > 0
+    ? await q<{ id: string }>(
+        `WITH tier(status, minutes, prio) AS (
+           VALUES ${TIER_VALUES}
+         )
+         SELECT e.id
+         FROM proxy_endpoints e
+         JOIN tier t ON t.status = e.lifecycle_status::text
+         JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+         WHERE e.deleted_at IS NULL
+           AND hs.last_check_at <= now() - (t.minutes || ' minutes')::interval
+         ORDER BY ${OVERDUE_ORDER}
+         LIMIT $1`,
+        [recheckQuota],
+      )
+    : [];
+
+  // 复探不足时，把余量还给首次探测 —— 否则新端点排队却白占着批次额度。
+  const spare = batch - fresh.length - recheck.length;
+  const extraFresh = spare > 0
+    ? await q<{ id: string }>(
+        `WITH tier(status, minutes, prio) AS (
+           VALUES ${TIER_VALUES}
+         )
+         SELECT e.id
+         FROM proxy_endpoints e
+         JOIN tier t ON t.status = e.lifecycle_status::text
+         LEFT JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+         WHERE e.deleted_at IS NULL
+           AND hs.last_check_at IS NULL
+           AND NOT (e.id = ANY($2::uuid[]))
+         ORDER BY t.prio DESC, e.created_at ASC
+         LIMIT $1`,
+        [spare, fresh.map((r) => r.id)],
+      )
+    : [];
+
+  const due = [...fresh, ...recheck, ...extraFresh];
 
   if (due.length === 0) return { jobId: null, picked: 0, reason: 'nothing-due' };
 
@@ -133,6 +251,26 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
 }
 
 /**
+ * 启动时回收**全部** RUNNING 任务。
+ *
+ * 只适用于单 worker 部署（PF_WORKER_MODE=embedded）。那种形态下
+ * "此刻还有 RUNNING 任务"只能说明它是上一个进程留下的 —— 因为唯一的
+ * worker 就是当前进程，而它才刚起来。
+ *
+ * 为什么不能只靠 `reclaimStaleJobs` 的租约到期：租约按分钟计，
+ * 进程重启后到租约过期之间，调度器的 busy 守卫会认为"有任务在跑"
+ * 从而一直不入队。表现出来就是**重启后探测静默停摆几分钟**，
+ * 日志里只有一行 busy，没有任何错误。这个坑在开发中已经踩过两次。
+ */
+export async function reclaimAllRunning(): Promise<number> {
+  return exec(
+    `UPDATE verification_jobs
+     SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL
+     WHERE status = 'RUNNING'`,
+  );
+}
+
+/**
  * 各档位当前的到期数量。
  *
  * 只给 `GET /verification/schedule` 用：界面要能回答"为什么它还没被探到"。
@@ -143,15 +281,11 @@ export async function scheduleBacklog(): Promise<
   Array<{ status: string; intervalMin: number | null; due: number; total: number }>
 > {
   const rows = await q<{ status: string; due: string; total: string }>(
-    `WITH tier(status, minutes) AS (
-       VALUES ('DISCOVERED',10), ('PENDING_VERIFICATION',10), ('DEGRADED',30),
-              ('VERIFIED',120), ('UNAVAILABLE',120), ('HEALTHY',360), ('QUARANTINED',720)
+    `WITH tier(status, minutes, prio) AS (
+       VALUES ${TIER_VALUES}
      )
      SELECT e.lifecycle_status::text AS status,
-            count(*) FILTER (
-              WHERE COALESCE(hs.last_check_at, e.created_at)
-                    <= now() - (t.minutes || ' minutes')::interval
-            )::text AS due,
+            count(*) FILTER (WHERE ${DUE_PREDICATE})::text AS due,
             count(*)::text AS total
      FROM proxy_endpoints e
      JOIN tier t ON t.status = e.lifecycle_status::text

@@ -5,12 +5,13 @@ import { exec, q, q1 } from '../db/client.js';
 import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
-import { enqueueDueProbes, pruneSchedulerJobs, reclaimStaleJobs } from '../modules/verification/schedule.js';
+import { enqueueDueProbes, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
 import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
 import { evaluateAlerts } from '../modules/events/evaluate.js';
 import { recomputeSourceQuality } from '../modules/source/quality.js';
+import { runIngestCycle } from '../modules/source/ingest.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -170,8 +171,25 @@ export async function relayOutbox(consumers: Consumer[] = CONSUMERS): Promise<vo
   }
 }
 
-async function claimJobs(): Promise<void> {
-  // 回收过期租约：进程在探测途中被强杀，那个任务会永远停在 RUNNING，
+/**
+ * 任务租约时长（分钟）。
+ *
+ * 这个数字直接决定**崩溃后探测要停多久**。租约没到期，`reclaimStaleJobs`
+ * 就不会回收那个 RUNNING 任务，而调度器的 busy 守卫看到"有任务在跑"
+ * 就一直不入队 —— 于是进程重启后探测会静默停摆，直到租约自然过期。
+ *
+ * 原来是 10 分钟，而一个调度批次的真实耗时是：
+ *   60 个端点 × 4 秒超时 / 并发 24 ≈ 10 秒
+ * 也就是说 10 分钟的租约是实际需要的 60 倍，纯粹是在惩罚正常重启。
+ *
+ * 2 分钟仍然留了 12 倍余量，够覆盖 PGlite 写入抖动与手工大批次任务。
+ */
+const LEASE_MINUTES = 2;
+
+/** 上一次因 busy 而暂停探测时看到的任务 id，用于日志去重 */
+let busyProbeJob: string | null = null;
+
+async function claimJobs(): Promise<void> {  // 回收过期租约：进程在探测途中被强杀，那个任务会永远停在 RUNNING，
   // 既不会被重试也不会被清理。判断条件与调度器的"是否在跑"共用一处。
   await reclaimStaleJobs();
 
@@ -186,7 +204,7 @@ async function claimJobs(): Promise<void> {
     const claimed = await exec(
       `UPDATE verification_jobs SET status = 'RUNNING', lease_owner = $2, attempts = attempts + 1,
               started_at = COALESCE(started_at, now()),
-              lease_expires_at = now() + interval '10 minutes'
+              lease_expires_at = now() + ${LEASE_MINUTES} * interval '1 minute'
        WHERE id = $1 AND status = 'PENDING'`,
       [job.id, `worker-${process.pid}`],
     );
@@ -264,6 +282,40 @@ async function pumpDiscovery(): Promise<void> {
     });
 }
 
+/**
+ * 自动采集流水线泵。
+ *
+ * 不 await：一次同步是 20 秒级的网络操作，阻塞 tick 会把 outbox 中继和
+ * 探测任务一起拖停。用 busy 标记保证同一时刻只有一轮在跑 ——
+ * PGlite 是单连接，并发跑两轮只会互相等锁。
+ */
+let ingestBusy = false;
+
+async function pumpIngest(): Promise<void> {
+  if (ingestBusy) return;
+  ingestBusy = true;
+  void runIngestCycle()
+    .then((r) => {
+      const parts: string[] = [];
+      if (r.synced > 0) {
+        const ok = r.items.filter((i) => i.ok).length;
+        const candidates = r.items.reduce((n, i) => n + i.candidates, 0);
+        parts.push(`同步 ${r.synced} 个源（成功 ${ok}）新增候选 ${candidates}`);
+      }
+      if (r.promoted > 0) parts.push(`晋级 ${r.promoted} 个端点`);
+      if (r.pauseReason === 'target-met') {
+        parts.push(`健康公开代理 ${r.healthyPublic} 个已达标，暂停晋级`);
+      } else if (r.pauseReason === 'probe-backlog') {
+        parts.push(`在途待探测 ${r.awaitingProbe} 个已满，等探测消化后再晋级`);
+      }
+      if (parts.length > 0) console.log(`[worker] 采集：${parts.join(' · ')}`);
+    })
+    .catch((err) => noteError('ingest', err))
+    .finally(() => {
+      ingestBusy = false;
+    });
+}
+
 async function tick(): Promise<void> {
   if (!running.value) return;
   try {
@@ -303,7 +355,30 @@ async function periodic(): Promise<void> {
     if (enq.picked > 0) {
       // 真正执行在 claimJobs（500ms 一次），这里只是入队
       console.log(`[worker] 探测入队 ${enq.picked} 个端点`);
+      busyProbeJob = null;
+    } else if (enq.reason === 'busy') {
+      // 被上一个任务挡住时必须留痕。这个分支原来是完全静默的，
+      // 结果是"进程重启后探测停了 10 分钟，日志里一个字都没有" ——
+      // 排查时只能靠数 /verification/schedule 里的 due 才发现不对。
+      // 按任务 id 去重，只在换了一个任务时打一行，避免每 15 秒刷屏。
+      const running = await q1<{ id: string; age: string }>(
+        `SELECT id, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int::text AS age
+         FROM verification_jobs
+         WHERE status IN ('PENDING','RUNNING') AND filter = '{"source":"scheduler"}'::jsonb
+         LIMIT 1`,
+      );
+      if (running && running.id !== busyProbeJob) {
+        busyProbeJob = running.id;
+        console.warn(
+          `[worker] 探测暂停：上一个调度任务 ${running.id.slice(0, 8)} 仍在运行（已 ${running.age}s）` +
+            '，到期端点会排在它后面',
+        );
+      }
     }
+    // 抓取新候选并晋级。放在探测调度之后：这一轮刚晋级的端点会进入
+    // 下一轮的探测队列，而不是插到已到期节点的前面。
+    phase = 'ingest';
+    await pumpIngest();
     // 池成员随健康态变化漂移，定期重算保证策略编译看到的是新鲜集合
     phase = 'pools';
     const pools = await q<{ id: string }>('SELECT id FROM resource_pools WHERE enabled = true');
@@ -363,6 +438,18 @@ async function periodic(): Promise<void> {
 export function startWorker(): () => void {
   running.value = true;
   console.log(`[worker] 启动 (outbox=${config.outboxIntervalMs}ms, sched=${config.schedulerIntervalMs}ms)`);
+
+  // embedded 模式下本进程就是唯一的 worker，所以启动时看到的 RUNNING 任务
+  // 必然是上一个进程的残留。立刻回收，不要等租约自然过期 ——
+  // 否则 busy 守卫会让探测在重启后静默停摆几分钟。
+  // process 模式不能这么做：那时可能有别的 worker 正在合法执行任务。
+  if (config.workerMode === 'embedded') {
+    void reclaimAllRunning()
+      .then((n) => {
+        if (n > 0) console.log(`[worker] 回收上次退出遗留的 ${n} 个运行中任务`);
+      })
+      .catch((err) => noteError('reclaim-startup', err));
+  }
 
   void periodic();
   void tick();

@@ -182,6 +182,44 @@ export const CATALOG: CatalogEntry[] = [
     notes: 'host:port:国家 三段格式',
   },
 
+  // ── 2026-11 扩源评估新增 ──
+  //
+  // 对 21 个候选源各抽 24 条走真实探测链（scripts/diag-candidates.mts），
+  // 只把**实测能建隧道**的加进来。判据是隧道率而不是存活率：`success=true`
+  // 只说明端口活着，只有 `connect_ok=true` 才说明它能在 Clash 里转发。
+  //
+  // 结果只有两支达标，其余全部落选，落选原因值得记下来：
+  //   · zloi-http / zloi-socks5 —— **已经是目录里的 hideipme-http / hideipme-socks5**
+  //     （同一个 GitHub 仓库 zloi-user/hideip.me），重复收录只会造成两条源抢同一批 IP
+  //   · mmpx12 / shiftytr / roosterkid —— 库里已有 AI 发现流程建的 `ai-gh-*` 源，同样重复
+  //   · proxyscrape-v4-* —— 与内置 proxyscrape-http/socks5 是同一个 API，只是 format 参数不同
+  //   · ercin-http(65536 条) / muronpig-http(101628 条) —— 条目极多但隧道率 0%。
+  //     **条目数不等于价值**，这两支是反例：10 万条里 24 条抽样没有一个能转发
+  //   · vakhov-socks5(4.8%) / mmpx12-http(4.2%) —— 有产出但太低，加进来只会摊薄探测预算
+  //   · proxylist.download / openproxy.space —— 502/521，源站已挂
+  {
+    key: 'iplocate-socks5',
+    name: 'iplocate · SOCKS5',
+    url: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt',
+    type: 'GITHUB_REPO',
+    formatHint: 'text',
+    protocolHint: 'SOCKS5',
+    trustLevel: 40,
+    syncIntervalSeconds: 3600,
+    notes: '24 条抽样：存活 13（54%）、能建隧道 3（12.5%）。899 条 × 12.5% ≈ 112 个可用隧道/轮，绝对量最大',
+  },
+  {
+    key: 'proxylistto-socks5',
+    name: 'proxylist.to · SOCKS5',
+    url: 'https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt',
+    type: 'GITHUB_REPO',
+    formatHint: 'text',
+    protocolHint: 'SOCKS5',
+    trustLevel: 38,
+    syncIntervalSeconds: 3600,
+    notes: '24 条抽样：存活 5（21%）、能建隧道 1（4.2%）；195 条，体量小但存活率不差',
+  },
+
   // ── API 型 ──
   {
     key: 'proxyscrape-http',

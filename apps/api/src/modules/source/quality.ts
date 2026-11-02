@@ -31,6 +31,31 @@ import { exec, q } from '../../db/client.js';
  *   2. 样本不足（< MIN_SAMPLE）不调分，保持上一次的值
  *   3. 停用必须写明原因和时间，不能变成一个"不知道为什么关掉的源"
  *
+ * 第四条（2026-11 补）：**停用只针对"采不到东西"的源，不针对"挖出来的 IP 死了"的源。**
+ *
+ * 这条是踩出来的。原实现只看分数，而分数算的是「从这个源挖出的端点现在还活着吗」——
+ * 对免费公开代理列表，这个比值**必然衰减到 0**：IP 存活期是几十分钟量级，
+ * 而 HEALTHY 的复探周期是 30 分钟、UNAVAILABLE 是 2 小时，等一轮探完，
+ * 相当一部分样本已经自然死亡。于是任何一个正常工作的源，只要连续挖了几天，
+ * 库存里都会堆满死节点，分数一路跌到阈值以下，然后被停用。
+ *
+ * 实测后果：26 个源里 10 个被自动停用，而其中 **9 个的 `last_sync_status` 是 OK、
+ * 最近一次同步分别抓到 167–1251 条** —— 它们根本没坏。最刺眼的是
+ * `hideipme-socks5`：被停用时分数 19.54（存活 2/227），而同一个 URL 现拉现测
+ * 24 条抽样是 15 条存活、8 条能建隧道（隧道率 33%）—— **它是全库最好的源**。
+ *
+ * 更糟的是停用并不能达到它宣称的目的。停用只掐掉「同步」（不再有新候选进来），
+ * 却**不掐掉「探测」** —— `enqueueDueProbes` 的查询里根本没有 `resource_sources`，
+ * 停用源的端点照样每轮被探。于是系统一边继续为死库存支付探测预算，
+ * 一边断掉了唯一能让分数回升的新鲜 IP 流入。这不是节省，是把恢复路径焊死。
+ *
+ * 所以停用的判据必须是「这个源还能不能采到东西」，而不是「它以前采到的东西还活不活」：
+ *   · `last_sync_status = 'FAILED'`       → 拉不到，停用是对的
+ *   · 最近一次快照 `candidate_count = 0`  → 拉到了但解析不出条目，停用是对的
+ *   · 其余情况（能拉到条目，只是库存衰减） → **只降权，不停用**
+ *
+ * 降权是可逆的建议（分数回来就还），停用是不可逆的剥夺 —— 两者的门槛不该一样。
+ *
  * 一条软约束：信任级是**双向**的。降到 55 分以下就扣，回到 75 分以上就还，
  * 但只还到中性值（50），不往上加分 —— 超过中性等于替人做背书。
  */
@@ -126,6 +151,14 @@ interface SourceRow {
   quality_score: string | null;
   quality_low_streak: number;
   auto_disabled_at: string | null;
+  /**
+   * 最近一次成功快照解析出的条目数。`null` = 从来没有过快照。
+   *
+   * 这是判断"源还能不能采到东西"的唯一可靠信号 —— 见文件头的第四条硬约束。
+   * 用快照而不是 `total_candidates` 累计值：累计值是历史总和，一个早已 404 的
+   * 源会带着几万条的累计值永远看起来"很有产出"。
+   */
+  last_candidate_count: number | null;
 }
 
 /**
@@ -136,10 +169,14 @@ interface SourceRow {
  */
 export async function recomputeSourceQuality(): Promise<QualityOutcome[]> {
   const sources = await q<SourceRow>(
-    `SELECT id, key, enabled, trust_level, authorization_status, last_sync_status,
-            quality_score::text, quality_low_streak, auto_disabled_at
-     FROM resource_sources
-     WHERE type <> 'MANUAL'`,
+    `SELECT s.id, s.key, s.enabled, s.trust_level, s.authorization_status, s.last_sync_status,
+            s.quality_score::text, s.quality_low_streak, s.auto_disabled_at,
+            (SELECT sn.candidate_count FROM source_snapshots sn
+              WHERE sn.source_id = s.id
+              ORDER BY sn.fetched_at DESC
+              LIMIT 1) AS last_candidate_count
+     FROM resource_sources s
+     WHERE s.type <> 'MANUAL'`,
   );
 
   const out: QualityOutcome[] = [];
@@ -209,17 +246,31 @@ export async function recomputeSourceQuality(): Promise<QualityOutcome[]> {
     const lowStreak = score < DOWNWEIGHT_SCORE ? s.quality_low_streak + 1 : 0;
     const authorized = s.authorization_status === 'AUTHORIZED';
 
+    /**
+     * 这个源是否**已经采不到东西**。停用的唯一正当理由。
+     *
+     * 三种情况都不算：
+     *   · `NEVER`（从没同步过）—— 没有证据，停用等于凭猜测剥夺
+     *   · 最近快照有产出 —— 源是好的，死的只是库存
+     *   · 快照为空但状态是 OK —— 边界情况，宁可放过一轮
+     */
+    const barren =
+      s.last_sync_status === 'FAILED' ||
+      (s.last_candidate_count !== null && s.last_candidate_count === 0);
+
     let action: QualityOutcome['action'] = 'none';
     let detail =
       `存活 ${alive}/${total}（${(aliveRatio * 100).toFixed(0)}%，` +
       `下界 ${(survivalFloor * 100).toFixed(0)}%），平均质量 ${(avgQuality ?? 0).toFixed(0)}`;
 
     // ── 自动停用 ──
-    // 门槛比降权更严：既要连续不佳，分数还得真的跌破 LOW_SCORE。
-    // 只看 streak 会在 41 分就把一个能用的源关掉。
+    // 门槛比降权更严：既要连续不佳，分数还得真的跌破 LOW_SCORE，
+    // 并且**源本身要采不到东西**（见文件头第四条硬约束）。
+    // 只看分数会在 20 分把全库最好的源关掉 —— 那正是实际发生过的事。
     if (
       lowStreak >= DISABLE_AFTER_STREAK &&
       score < LOW_SCORE &&
+      barren &&
       s.enabled &&
       !authorized
     ) {
@@ -254,6 +305,10 @@ export async function recomputeSourceQuality(): Promise<QualityOutcome[]> {
       await exec(`UPDATE resource_sources SET trust_level = $2 WHERE id = $1`, [s.id, next]);
       action = 'downweighted';
       detail += ` → 信任级 ${s.trust_level} → ${next}`;
+      // 分数已经跌破停用线却没停用，必须说清原因，否则日志里看起来像漏判
+      if (score < LOW_SCORE && !barren) {
+        detail += `（源仍在正常产出 ${s.last_candidate_count ?? '?'} 条/次，不停用）`;
+      }
     }
     // ── 恢复信任级 ──
     // 没有这条时 trust_level 是单向阀：降下去就再也回不来。

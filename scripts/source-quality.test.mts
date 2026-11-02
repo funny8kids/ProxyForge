@@ -44,13 +44,19 @@ async function check(name: string, fn: () => Promise<void>): Promise<void> {
 await getDb();
 await migrate();
 
-/** 建一个来源。默认是"公开列表"那种：UNKNOWN 授权、trust 40、启用中。 */
+/**
+ * 建一个来源。默认是"公开列表"那种：UNKNOWN 授权、trust 40、启用中。
+ *
+ * `lastYield` 决定最近一次快照解析出多少条目 —— 这是「这个源还能不能采到东西」
+ * 的唯一信号，也是自动停用的前置条件。不传 = 从来没有过快照（新加的源）。
+ */
 async function mkSource(opts: {
   key: string;
   trust?: number;
   auth?: 'AUTHORIZED' | 'UNKNOWN';
   enabled?: boolean;
   lastSync?: 'NEVER' | 'OK' | 'FAILED';
+  lastYield?: number;
 }): Promise<string> {
   const id = randomUUID();
   await exec(
@@ -62,6 +68,13 @@ async function mkSource(opts: {
       opts.auth ?? 'UNKNOWN', opts.trust ?? 40, opts.enabled ?? true, opts.lastSync ?? 'OK',
     ],
   );
+  if (opts.lastYield !== undefined) {
+    await exec(
+      `INSERT INTO source_snapshots (source_id, http_status, content_hash, candidate_count)
+       VALUES ($1, 200, $2, $3)`,
+      [id, `hash-${id}`, opts.lastYield],
+    );
+  }
   return id;
 }
 
@@ -175,7 +188,8 @@ await check('信任级恢复到中性值（50）就停，不继续往上加分',
 
 console.log('\n[3] 低分降权');
 
-const bad = await mkSource({ key: 'bad', trust: 40 });
+// 最近一次同步抓到 0 条 —— 这个源"采不到东西"，才具备被停用的资格
+const bad = await mkSource({ key: 'bad', trust: 40, lastYield: 0 });
 await mkNodes(bad, { n: 8, alive: 2, quality: 20 });
 
 await check('存活 2/8、质量 20 → 14.22 分，信任级 40 → 35', async () => {
@@ -233,17 +247,45 @@ await check('存活 12%、质量 45 的源连续多轮不被停用', async () =>
   assert.equal(row.auto_disabled_at, null);
 });
 
-await check('存活 0% 的源照样会被停用（阈值下调不是放水）', async () => {
+await check('采不到条目的源照样会被停用（阈值下调不是放水）', async () => {
   // 反面断言：降到 20 之后，真的没救的源必须仍然被停掉。
   // proxifly / hideipme-http 实测存活 0/200 和 0/33。
-  const dead = await mkSource({ key: 'dead-source', trust: 40 });
+  //
+  // 这里必须给 `lastYield: 0`：从 2026-11 起，"零存活"本身不再是停用的理由
+  // （见下一条用例），停用要求源**采不到东西**。
+  const dead = await mkSource({ key: 'dead-source', trust: 40, lastYield: 0 });
   await mkNodes(dead, { n: 50, alive: 0, quality: 0 });
 
   await recomputeSourceQuality();
   await recomputeSourceQuality();
 
   const row = await sourceRow(dead);
-  assert.equal(row.enabled, false, '零存活的源必须停用，否则白烧探测预算');
+  assert.equal(row.enabled, false, '采不到东西的源必须停用，否则白烧探测预算');
+});
+
+await check('零存活但仍在正常产出的源：只降权，绝不停用', async () => {
+  // 这是实际踩到的坑。免费代理的 IP 存活期是几十分钟量级，而 HEALTHY 的
+  // 复探周期是 30 分钟 —— 一个**完全正常**的源，库存里的节点也会随时间
+  // 大批死亡，"库存存活率"必然衰减到 0。
+  //
+  // 实测：26 个源里 10 个被自动停用，其中 9 个 last_sync_status 是 OK、
+  // 最近一次同步分别抓到 167–1251 条。最刺眼的是 hideipme-socks5 ——
+  // 被停用时分数 19.54（存活 2/227），而同一个 URL 现拉现测 24 条抽样
+  // 是 15 条存活、8 条能建隧道（33%），**它是全库最好的源**。
+  //
+  // 更关键的是停用根本达不到目的：停用只掐掉同步（新 IP 进不来），
+  // 却不掐掉探测（enqueueDueProbes 里没有 resource_sources），
+  // 于是一边继续为死库存烧预算，一边焊死了唯一能让分数回升的路径。
+  const yielding = await mkSource({ key: 'zero-stock-but-yielding', trust: 40, lastYield: 640 });
+  await mkNodes(yielding, { n: 200, alive: 0, quality: 0 });
+
+  for (let i = 0; i < 4; i += 1) await recomputeSourceQuality();
+
+  const row = await sourceRow(yielding);
+  assert.equal(row.enabled, true, '能拉到 640 条/次的源不该被停用');
+  assert.equal(row.auto_disabled_at, null);
+  assert.equal(row.trust_level, 25, '但要被降到信任级地板 —— 它是可逆的惩罚');
+  assert.ok(row.quality_low_streak >= 2, '低分仍要计数，供人看');
 });
 
 console.log('\n[5] AUTHORIZED 豁免');

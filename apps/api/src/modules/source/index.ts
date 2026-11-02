@@ -221,6 +221,26 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
       throw invalid('autoPromote 必须同时声明 authorization（AUTHORIZED 或 RESTRICTED）');
     }
 
+    /**
+     * 人工启用必须**同时**清掉自动停用的痕迹。
+     *
+     * 原来只改 `enabled`，`auto_disabled_at` 与 `quality_low_streak` 原样留着。
+     * 后果是用户的启用动作在 5 分钟内被静默推翻：质量重算每 5 分钟一次，
+     * 停用分支的条件是「连续 ≥2 次低分」，而 streak 在停用时已经是 43 ——
+     * 下一轮只要分数仍低于阈值，就立刻再关一次。用户会看到源"自己又关了"，
+     * 且没有任何提示。
+     *
+     * 实测就是这个形态：hideipme-socks5 的 streak 是 43，手工启用之后
+     * 下一个重算周期就回到停用。而它恰好是当时**隧道可用率最高**的源
+     * （现拉现测 12 条：8 条存活、6 条能建隧道），被关掉的直接原因是
+     * 分数按"库存存活"算 —— 一个必然会衰减到 0 的口径（见 quality.ts）。
+     *
+     * 清 streak 不是"放宽标准"，而是**重置证据**：自动判定基于旧证据，
+     * 人既然否定了这个判定，就必须让它从零开始重新累积，否则人和机器
+     * 会陷入"你开我关"的死循环，而用户完全不知道发生了什么。
+     */
+    const enableNow = body.enabled === true;
+
     await tx(async (t) => {
       await t.exec(
         `UPDATE resource_sources SET
@@ -232,13 +252,17 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
            notes = COALESCE($7, notes),
            auto_promote = CASE WHEN $8 THEN true ELSE auto_promote END,
            auto_promote_authorization = CASE WHEN $8 THEN $9::authorization_status
-                                             ELSE auto_promote_authorization END
+                                             ELSE auto_promote_authorization END,
+           -- 人工启用：清掉自动停用的痕迹，让重算从零开始累积证据
+           auto_disabled_at = CASE WHEN $10 THEN NULL ELSE auto_disabled_at END,
+           auto_disable_reason = CASE WHEN $10 THEN NULL ELSE auto_disable_reason END,
+           quality_low_streak = CASE WHEN $10 THEN 0 ELSE quality_low_streak END
          WHERE id = $1`,
         [
           id, (body.name as string) ?? null, (body.enabled as boolean) ?? null,
           (body.authorizationStatus as string) ?? null, (body.trustLevel as number) ?? null,
           (body.syncIntervalSeconds as number) ?? null, (body.notes as string) ?? null,
-          autoPromote, autoAuth,
+          autoPromote, autoAuth, enableNow,
         ],
       );
       await audit(t, {

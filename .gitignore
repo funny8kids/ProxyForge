@@ -16,6 +16,9 @@ build/
 !docs/**/*.png
 !prototype/**/*.png
 
+# 诊断脚本的临时输出（curl 落盘、评估日志等），不属于交付物
+.tmp/
+
 # 环境变量：.env.example 是模板，.env 是本机真实配置
 .env
 .env.local

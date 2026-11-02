@@ -155,6 +155,13 @@ const entry = process.argv[1];
 const isMain = entry?.endsWith('main.ts') || entry?.endsWith('main.js');
 if (isMain) {
   await migrate();
+  // 启动时把环境变量里的 AI 密钥注入（幂等）。不这样做的话，
+  // 改密钥就得跑一次 db:reset —— 而 reset 会清掉全部真实采集数据。
+  const { bootstrapAiFromEnv } = await import('./db/bootstrap-ai.js');
+  const aiBootstrap = await bootstrapAiFromEnv();
+  for (const r of aiBootstrap) {
+    if (r.applied) console.log(`  ✓ AI 密钥：${r.providerKey} — ${r.detail}`);
+  }
   const app = await buildApp();
   await app.listen({ port: config.port, host: config.host });
   console.log(`ProxyForge API → http://${config.host}:${config.port}/api/v1`);

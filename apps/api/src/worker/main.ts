@@ -5,6 +5,7 @@ import { exec, q, q1 } from '../db/client.js';
 import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
+import { runDiscoveryTask } from '../modules/ai/discovery.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -23,7 +24,7 @@ import { runVerificationJob } from '../modules/verification/index.js';
  */
 
 const running = { value: true };
-const stats = { outbox: 0, jobs: 0, errors: 0 };
+const stats = { outbox: 0, jobs: 0, discovery: 0, errors: 0 };
 /**
  * 最后一次失败的摘要。
  *
@@ -111,11 +112,46 @@ async function maintainPartitions(): Promise<void> {
   await exec(`SELECT drop_expired_partitions('gateway_traffic_samples', 6)`);
 }
 
+/**
+ * AI 发现任务泵。
+ *
+ * 不 await：一次 LLM 调用几秒到几十秒，阻塞 tick 会把 outbox 中继和验证任务
+ * 一起拖停。用 busy 标记保证同一时刻只有一个发现任务在跑 —— PGlite 是单连接，
+ * 并发跑多个只会互相等锁。
+ */
+let discoveryBusy = false;
+
+async function pumpDiscovery(): Promise<void> {
+  if (discoveryBusy) return;
+  const task = await q1<{ id: string }>(
+    `SELECT id FROM ai_discovery_tasks
+     WHERE status = 'PENDING' AND run_after <= now() AND attempts < max_attempts
+     ORDER BY priority DESC, run_after ASC
+     LIMIT 1`,
+  );
+  if (!task) return;
+
+  discoveryBusy = true;
+  void runDiscoveryTask(task.id)
+    .then((r) => {
+      console.log(
+        `[worker] AI 发现完成 ${r.taskId.slice(0, 8)}：提出 ${r.proposed} · 采纳 ${r.accepted}` +
+          (r.error ? ` · ${r.error}` : ''),
+      );
+      if (r.accepted > 0) stats.discovery += 1;
+    })
+    .catch((err) => noteError('discovery', err))
+    .finally(() => {
+      discoveryBusy = false;
+    });
+}
+
 async function tick(): Promise<void> {
   if (!running.value) return;
   try {
     await relayOutbox();
     await claimJobs();
+    await pumpDiscovery();
   } catch (err) {
     noteError('tick', err);
     console.error('[worker] tick 失败', err);

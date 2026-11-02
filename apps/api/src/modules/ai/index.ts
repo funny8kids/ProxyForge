@@ -1,11 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import type { AiProviderRow, AiTaskBindingRow, AiTaskType } from '@proxyforge/contracts';
-import { q, q1, tx } from '../../db/client.js';
+import { exec, q, q1, tx } from '../../db/client.js';
 import { actorOf, guard } from '../auth/index.js';
 import { audit } from '../../shared/events.js';
 import { invalid, notFound } from '../../shared/errors.js';
 import { uuidv7 } from '../../shared/id.js';
 import { maskSecret, seal } from '../../shared/crypto.js';
+import { checkPublicUrl } from '../../shared/url.js';
+import { chat, probeProvider } from './client.js';
 
 /**
  * AI Provider Registry（ADR-0005）
@@ -16,39 +18,13 @@ import { maskSecret, seal } from '../../shared/crypto.js';
  *      让服务器访问内网元数据接口的跳板。
  */
 
-const PRIVATE_PATTERNS = [
-  /^127\./,
-  /^10\./,
-  /^192\.168\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^169\.254\./,   // 链路本地 + 云元数据
-  /^0\./,
-  /^::1$/,
-  /^fc00:/i,
-  /^fe80:/i,
-];
-
 function assertSafeUrl(raw: string, allowPrivate: boolean): void {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw invalid('baseUrl 不是合法 URL', [{ field: 'baseUrl', message: raw }]);
-  }
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw invalid('baseUrl 仅支持 http/https');
-  }
-  const host = url.hostname;
-  const isPrivate =
-    PRIVATE_PATTERNS.some((p) => p.test(host)) ||
-    host === 'localhost' ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal');
-
-  if (isPrivate && !allowPrivate) {
-    throw invalid('baseUrl 指向内网地址，已被 SSRF 防护拦截', [
-      { field: 'baseUrl', message: '如需访问本地 Ollama，请显式开启 allowPrivateNetwork（需 ADMIN）' },
-    ]);
+  const check = checkPublicUrl(raw, { allowPrivate });
+  if (!check.ok) {
+    throw invalid(
+      check.reason === '不是合法 URL' ? 'baseUrl 不是合法 URL' : `baseUrl ${check.reason}`,
+      [{ field: 'baseUrl', message: raw }],
+    );
   }
 }
 
@@ -185,40 +161,23 @@ export async function registerAiRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
-  /** 连接测试：只打 /models，不发送任何业务 prompt */
+  /**
+   * 连接测试。
+   *
+   * 原实现只打 `/models` 且**没带 Authorization 头** —— 对 DeepSeek 这类
+   * 允许匿名列模型的供应商会假阳性，对要求鉴权的会假阴性。现在改成：
+   * 先列模型（带密钥），再真发一次最小 chat。只有 chat 通了才算可用。
+   */
   app.post('/ai/providers/:id/test', { preHandler: guard('ai:write') }, async (req) => {
     const { id } = req.params as { id: string };
-    const p = await q1<{ base_url: string; timeout_ms: number; api_key_ref: string | null; type: string }>(
-      'SELECT base_url, timeout_ms, api_key_ref, type FROM ai_providers WHERE id = $1',
-      [id],
-    );
-    if (!p) throw notFound('AI Provider');
+    const exists = await q1<{ id: string }>('SELECT id FROM ai_providers WHERE id = $1', [id]);
+    if (!exists) throw notFound('AI Provider');
 
-    const t0 = performance.now();
-    let ok = false;
-    let detail = '';
-    let models: string[] = [];
-
-    try {
-      const url = p.type === 'OLLAMA' ? `${p.base_url.replace(/\/$/, '')}/api/tags` : `${p.base_url.replace(/\/$/, '')}/v1/models`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(p.timeout_ms) });
-      ok = res.ok;
-      detail = `HTTP ${res.status}`;
-      if (res.ok) {
-        const data = (await res.json()) as { data?: Array<{ id: string }>; models?: Array<{ name: string }> };
-        models = data.data?.map((m) => m.id) ?? data.models?.map((m) => m.name) ?? [];
-      }
-    } catch (err) {
-      detail = err instanceof Error ? err.message : String(err);
-    }
-
-    const latency = Math.round(performance.now() - t0);
-    await q1('SELECT 1');
-    await tx(async (t) => {
-      await t.exec('UPDATE ai_providers SET last_tested_at = now(), last_test_ok = $2 WHERE id = $1', [id, ok]);
-    });
-
-    return { ok, latencyMs: latency, detail, models };
+    const result = await probeProvider(id);
+    await exec('UPDATE ai_providers SET last_tested_at = now(), last_test_ok = $2 WHERE id = $1', [
+      id, result.ok,
+    ]);
+    return result;
   });
 
   app.get('/ai/models', { preHandler: guard('ai:read') }, async (req) => {
@@ -289,6 +248,8 @@ export async function registerAiRoutes(app: FastifyInstance): Promise<void> {
       `SELECT ${col} AS key,
               count(*)::int AS calls,
               sum(u.prompt_tokens + u.completion_tokens)::int AS tokens,
+              sum(u.cached_prompt_tokens)::int AS cached_tokens,
+              sum(u.reasoning_tokens)::int AS reasoning_tokens,
               round(sum(u.cost_usd), 6)::text AS cost_usd,
               round(avg(u.latency_ms))::int AS avg_latency_ms,
               count(*) FILTER (WHERE NOT u.success)::int AS errors
@@ -299,5 +260,34 @@ export async function registerAiRoutes(app: FastifyInstance): Promise<void> {
        GROUP BY 1 ORDER BY 2 DESC`,
     );
     return { items: rows };
+  });
+
+  /**
+   * 直接试跑一次对话。
+   *
+   * 和 `/providers/:id/test` 的区别：那个只验证"通路"，这个带真实 prompt，
+   * 用来调任务绑定链的效果 —— 换模型前后同一句 prompt 的输出差异能直接看到。
+   */
+  app.post('/ai/ping', { preHandler: guard('ai:write') }, async (req) => {
+    const body = (req.body ?? {}) as {
+      taskType?: AiTaskType; prompt?: string; json?: boolean; providerId?: string;
+      thinking?: 'enabled' | 'disabled';
+    };
+    const prompt = (body.prompt ?? '').trim();
+    if (!prompt) throw invalid('prompt 必填');
+    if (prompt.length > 8000) throw invalid('prompt 过长（上限 8000 字符）');
+
+    const result = await chat({
+      taskType: body.taskType ?? 'ASSISTANT',
+      json: body.json === true,
+      onlyProviderId: body.providerId,
+      // 不传时按任务类型取默认值（DISCOVERY/ANALYZER 开思考，CLASSIFIER/ASSISTANT 关）
+      thinking: body.thinking,
+      messages: [
+        { role: 'system', content: '你是一个精确、简洁的助手。不要输出多余的解释。' },
+        { role: 'user', content: prompt },
+      ],
+    });
+    return result;
   });
 }

@@ -9,6 +9,7 @@ import { dedupeKey, parseProxyLine } from '../../shared/parser.js';
 import { extractEntries } from '../../shared/extract.js';
 import { CATALOG } from '../../shared/sources-catalog.js';
 import { sha256Hex } from '../../shared/crypto.js';
+import { runDiscoveryTask } from '../ai/discovery.js';
 
 /** 一批插入的候选行数。9 个参数 × 250 行 = 2250 个占位符，远低于 PG 的 65535 上限，
  *  同时把往返次数从「一行一次」压到「两百多行一次」—— PGlite 是单写者，
@@ -190,6 +191,65 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
       });
     });
     return { ok: true };
+  });
+
+  /**
+   * 删除来源。
+   *
+   * 候选区随来源级联删除（ON DELETE CASCADE）—— 那些行没有独立价值。
+   * 但**已晋级的端点不删**：它们的 `source_id` 会被置空，因为端点本身
+   * 有健康历史与授权记录，删来源不应该连带销毁已验证的资产。
+   *
+   * 代价是溯源信息会丢。所以默认拒绝：来源下还有已晋级端点时要求显式
+   * `?force=1`，让"我知道会丢掉这批端点的来源线索"成为一个明确动作。
+   */
+  app.delete('/sources/:id', { preHandler: guard('source:write') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const { force } = req.query as { force?: string };
+    const actor = actorOf(req);
+
+    const source = await q1<{ id: string; key: string; name: string }>(
+      'SELECT id, key, name FROM resource_sources WHERE id = $1',
+      [id],
+    );
+    if (!source) throw notFound('来源');
+
+    const promoted = await q1<{ c: string }>(
+      'SELECT count(*)::text AS c FROM proxy_endpoints WHERE source_id = $1',
+      [id],
+    );
+    const promotedCount = Number(promoted?.c ?? 0);
+    if (promotedCount > 0 && force !== '1') {
+      throw invalid(
+        `该来源下有 ${promotedCount} 个已晋级端点。删除会断开它们的溯源信息，` +
+          '端点本身保留。确认请加 ?force=1',
+        [{ field: 'force', message: '需要显式确认' }],
+      );
+    }
+
+    const candidates = await q1<{ c: string }>(
+      'SELECT count(*)::text AS c FROM candidate_endpoints WHERE source_id = $1',
+      [id],
+    );
+
+    await tx(async (t) => {
+      await t.exec('DELETE FROM resource_sources WHERE id = $1', [id]);
+      await audit(t, {
+        actorType: actor.kind, actorId: actor.id, action: 'source.delete',
+        resourceType: 'source', resourceId: id,
+        beforeState: {
+          key: source.key, name: source.name,
+          candidatesRemoved: Number(candidates?.c ?? 0),
+          endpointsDetached: promotedCount,
+        },
+      });
+    });
+
+    return {
+      ok: true,
+      candidatesRemoved: Number(candidates?.c ?? 0),
+      endpointsDetached: promotedCount,
+    };
   });
 
   /**
@@ -529,9 +589,45 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
 
   app.get('/intelligence/tasks', { preHandler: guard('source:read') }, async () => {
     const rows = await q<Record<string, unknown>>(
-      'SELECT * FROM ai_discovery_tasks ORDER BY created_at DESC LIMIT 50',
+      `SELECT t.id, t.query, t.status, t.result_summary, t.proposed_sources, t.model_name,
+              t.error_message, t.attempts, t.created_at, t.started_at, t.finished_at
+       FROM ai_discovery_tasks t
+       ORDER BY t.created_at DESC
+       LIMIT 50`,
     );
     return { items: rows };
+  });
+
+  app.get('/intelligence/tasks/:id', { preHandler: guard('source:read') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const row = await q1<Record<string, unknown>>(
+      `SELECT id, query, status, result_summary, proposed_sources, model_name,
+              error_message, attempts, created_at, started_at, finished_at
+       FROM ai_discovery_tasks WHERE id = $1`,
+      [id],
+    );
+    if (!row) throw notFound('发现任务');
+    return row;
+  });
+
+  /**
+   * 立即执行一条待处理的发现任务。
+   *
+   * worker 每 500ms 会自己认领，这个端点只是给界面一个"我不想等"的入口。
+   * 内部仍走同一个 runDiscoveryTask —— 认领是原子的，不会和 worker 重复执行。
+   */
+  app.post('/intelligence/tasks/:id/run', { preHandler: guard('source:write') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const exists = await q1<{ id: string; status: string }>(
+      'SELECT id, status FROM ai_discovery_tasks WHERE id = $1',
+      [id],
+    );
+    if (!exists) throw notFound('发现任务');
+    if (exists.status === 'SUCCEEDED' || exists.status === 'CANCELLED') {
+      throw invalid(`任务已是 ${exists.status} 状态，不能重复执行`);
+    }
+    const outcome = await runDiscoveryTask(id);
+    return outcome;
   });
 }
 

@@ -390,67 +390,60 @@ export async function seed(): Promise<void> {
   const aiOllama = uuidv7();
   await exec(
     `INSERT INTO ai_providers (id, key, name, type, base_url, enabled, timeout_ms, budget_monthly_usd,
-       spent_current_month, last_tested_at, last_test_ok, allow_private_network)
+       spent_current_month, last_tested_at, last_test_ok, allow_private_network, notes)
      VALUES
-       ($1,'deepseek-main','DeepSeek','OPENAI_COMPATIBLE','https://api.deepseek.com',true,30000,50.00,12.4821, now() - interval '12 minutes', true, false),
-       ($2,'openrouter','OpenRouter','OPENAI_COMPATIBLE','https://openrouter.ai/api/v1',true,45000,30.00,4.1103, now() - interval '40 minutes', true, false),
-       ($3,'ollama-local','Ollama (local)','OLLAMA','http://127.0.0.1:11434',false,120000,NULL,0, now() - interval '3 hours', false, true)`,
+       ($1,'deepseek-main','DeepSeek','OPENAI_COMPATIBLE','https://api.deepseek.com',true,60000,20.00,0,NULL,NULL,false,'DeepSeek-V4.1-Flash；密钥由 PF_DEEPSEEK_API_KEY 注入，不写进仓库'),
+       ($2,'openrouter','OpenRouter','OPENAI_COMPATIBLE','https://openrouter.ai/api/v1',false,45000,30.00,0,NULL,NULL,false,'备用降级链，未配置密钥'),
+       ($3,'ollama-local','Ollama (local)','OLLAMA','http://127.0.0.1:11434',false,120000,NULL,0,NULL,NULL,true,'本地模型，需 PF_ALLOW_PRIVATE_AI=true')`,
     [aiDeepseek, aiOpenrouter, aiOllama],
   );
 
-  const models: Array<[string, string, string, number, number]> = [
-    [aiDeepseek, 'deepseek-chat', 'DeepSeek Chat', 0.00014, 0.00028],
-    [aiDeepseek, 'deepseek-reasoner', 'DeepSeek Reasoner', 0.00055, 0.00219],
-    [aiOpenrouter, 'anthropic/claude-sonnet-4', 'Claude Sonnet 4', 0.003, 0.015],
-    [aiOpenrouter, 'meta-llama/llama-3.3-70b', 'Llama 3.3 70B', 0.00059, 0.00079],
-    [aiOllama, 'qwen2.5:14b', 'Qwen 2.5 14B', 0, 0],
+  // 价格单位：USD / 1k tokens。
+  // DeepSeek 官方价按「元 / 百万 tokens」计，按 1 USD ≈ 7.1 CNY 折算，
+  // 并取**高峰时段**价（空闲时段是它的一半）—— 宁高估不低估，预算拦截才有意义。
+  //   deepseek-flash  未命中 2 元/M → 0.000282 · 命中 0.04 元/M → 0.000006 · 输出 8 元/M → 0.001127
+  //   deepseek-v4-pro 未命中 9 元/M → 0.001268 · 命中 0.30 元/M → 0.000042 · 输出 27 元/M → 0.003803
+  const models: Array<[string, string, string, number, number, number, number]> = [
+    [aiDeepseek, 'deepseek-flash', 'DeepSeek V4.1 Flash', 0.000282, 0.001127, 0.000006, 1048576],
+    [aiDeepseek, 'deepseek-v4-pro', 'DeepSeek V4 Pro', 0.001268, 0.003803, 0.000042, 1048576],
+    [aiOpenrouter, 'anthropic/claude-sonnet-4', 'Claude Sonnet 4', 0.003, 0.015, 0.0003, 200000],
+    [aiOllama, 'qwen2.5:14b', 'Qwen 2.5 14B', 0, 0, 0, 32768],
   ];
   const modelIds: Record<string, string> = {};
-  for (const [pid, name, display, inCost, outCost] of models) {
+  for (const [pid, name, display, inCost, outCost, cachedCost, ctx] of models) {
     const id = uuidv7();
     modelIds[`${pid}:${name}`] = id;
     await exec(
-      `INSERT INTO ai_models (id, provider_id, model_name, display_name, input_cost_per_1k, output_cost_per_1k, supports_json)
-       VALUES ($1,$2,$3,$4,$5,$6,true)`,
-      [id, pid, name, display, inCost, outCost],
+      `INSERT INTO ai_models (id, provider_id, model_name, display_name, context_window,
+         input_cost_per_1k, output_cost_per_1k, cached_input_cost_per_1k, supports_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)`,
+      [id, pid, name, display, ctx, inCost, outCost, cachedCost],
     );
   }
 
+  // 降级链：flash 打头（快、便宜、够用），pro 兜底（复杂推理）。
+  // priority 数字小的先试，串行降级见 modules/ai/client.ts。
+  const flashId = modelIds[`${aiDeepseek}:deepseek-flash`]!;
+  const proId = modelIds[`${aiDeepseek}:deepseek-v4-pro`]!;
   await exec(
     `INSERT INTO ai_task_bindings (id, task_type, provider_id, model_id, priority, max_tokens, temperature) VALUES
-       ($1,'DISCOVERY',$2,$3,100,2000,0.2),
-       ($4,'DISCOVERY',$5,$6,110,2000,0.3),
-       ($7,'ANALYZER',$2,$8,100,4000,0.1),
-       ($9,'CLASSIFIER',$2,$10,100,1000,0.0),
-       ($11,'EVALUATOR',$5,$12,100,2000,0.0)`,
-    [
-      uuidv7(), aiDeepseek, modelIds[`${aiDeepseek}:deepseek-chat`],
-      uuidv7(), aiOpenrouter, modelIds[`${aiOpenrouter}:meta-llama/llama-3.3-70b`],
-      uuidv7(), modelIds[`${aiDeepseek}:deepseek-reasoner`],
-      uuidv7(), modelIds[`${aiDeepseek}:deepseek-chat`],
-      uuidv7(), modelIds[`${aiOpenrouter}:anthropic/claude-sonnet-4`],
-    ],
+       ($1,'DISCOVERY',$2,$3,100,2500,0.2),
+       ($4,'DISCOVERY',$2,$5,110,2500,0.2),
+       ($6,'ANALYZER',$2,$5,100,4000,0.1),
+       ($7,'CLASSIFIER',$2,$3,100,1200,0.0),
+       ($8,'EVALUATOR',$2,$5,100,2500,0.0),
+       ($9,'ASSISTANT',$2,$3,100,2000,0.3)`,
+    [uuidv7(), aiDeepseek, flashId, uuidv7(), proId, uuidv7(), uuidv7(), uuidv7(), uuidv7()],
   );
 
-  // AI 用量记录（30 天）
-  for (let d = 29; d >= 0; d -= 1) {
-    const calls = between(8, 40);
-    for (let i = 0; i < calls; i += 1) {
-      const isDs = rnd() < 0.72;
-      const pid = isDs ? aiDeepseek : aiOpenrouter;
-      const mid = isDs ? modelIds[`${aiDeepseek}:deepseek-chat`] : modelIds[`${aiOpenrouter}:meta-llama/llama-3.3-70b`];
-      const pt = between(300, 3000);
-      const ct = between(100, 1200);
-      const ok = rnd() > 0.04;
-      await exec(
-        `INSERT INTO ai_usage_records (provider_id, model_id, task_type, prompt_tokens, completion_tokens,
-           cost_usd, latency_ms, success, occurred_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now() - interval '${d} days' - interval '${between(0, 23)} hours')`,
-        [pid, mid, pick(['DISCOVERY', 'ANALYZER', 'CLASSIFIER', 'EVALUATOR']), pt, ct,
-         (pt / 1000) * 0.00014 + (ct / 1000) * 0.00028, between(400, 4200), ok],
-      );
-    }
-  }
+  // AI 用量记录：**不造假**。
+  //
+  // 这里刻意留空。原因有两个：
+  //   1. `ai_providers.spent_current_month` 是预算拦截的依据，如果用量表是假的
+  //      而累计额是真的（或反过来），预算判断就成了摆设；
+  //   2. 用量是唯一能证明"模型真的被调用过"的证据，编造它等于让运维失去唯一的
+  //      事实来源 —— 界面上一片活跃，实际一次都没打通。
+  // 真实调用（发现任务 / /ai/ping）会自己写进这张表。
 
   // ── 网关流量采样（24h × 每小时） ──
   for (let h = 23; h >= 0; h -= 1) {
@@ -549,6 +542,12 @@ export async function seed(): Promise<void> {
       ? ' · ' + res.warnings.map((w) => `${w.code}×${w.count ?? 0}`).join(', ')
       : '';
     console.log(`  ✓ 网关配置已编译：${inst.name} → v${res.version}（${res.memberCount} 成员${warn}）`);
+  }
+
+  // 密钥来自环境变量，不写进种子（仓库是公开的）
+  const { bootstrapAiFromEnv } = await import('./bootstrap-ai.js');
+  for (const r of await bootstrapAiFromEnv()) {
+    console.log(`  ${r.applied ? '✓' : '·'} AI 密钥 ${r.providerKey}：${r.detail}`);
   }
 
   console.log(`  ✓ 种子完成 (${Math.round(performance.now() - t0)}ms)`);

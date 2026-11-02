@@ -12,6 +12,7 @@ import { invalid, notFound } from '../../shared/errors.js';
 import { uuidv7 } from '../../shared/id.js';
 import { open } from '../../shared/crypto.js';
 import { probe, qualityScore, type ProbeResult } from './probe.js';
+import { linkExitGeography } from './geo.js';
 
 /**
  * 探针模式。
@@ -291,6 +292,13 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
         score,
       ],
     );
+
+    // 出口地理回填：用本次探测已经拿到的 exitIp/exitCountry，不额外发请求。
+    // 之前这两个字段只落进 health_checks 就再没人读，导致端点表的
+    // ip_asset_id 永远为 null，国家列与地区分布整条链路都是空的。
+    if (r.success) {
+      await linkExitGeography(t, endpointId, r.exitIp, r.exitCountry);
+    }
 
     // 生命周期推进：连续失败 3 次才降级，避免抖动误伤
     const cur = await t.q1<{ lifecycle_status: string; trust_tier: string }>(

@@ -140,6 +140,24 @@ export async function registerResourceRoutes(app: FastifyInstance): Promise<void
       where.push(`(lower(e.host) LIKE $${params.length} OR lower(coalesce(e.display_name,'')) LIKE $${params.length})`);
     }
     /**
+     * 出口国家筛选。逗号分隔多选（`?country=JP,SG`）。
+     *
+     * 用 `trim(...)` 而不是直接比：`country_code` 是 `char(2)`，定长补空格。
+     * 直接和 `'JP'` 比时 PG 会按 char 语义忽略尾空格，但一旦转成 text 数组
+     * 比较就会带上空格，表现是"筛选了却一条都不出来"。
+     *
+     * 非法值（三字母、空串）直接丢弃而不是报 400：前端拼参数时很容易
+     * 带进一个空项，为此弹一个错误提示属于过度反应。
+     */
+    const countries = String(query.country ?? '')
+      .split(',')
+      .map((c) => c.trim().toUpperCase())
+      .filter((c) => /^[A-Z]{2}$/.test(c));
+    if (countries.length) {
+      params.push(countries);
+      where.push(`trim(i.country_code) = ANY($${params.length}::text[])`);
+    }
+    /**
      * 分页游标不能进 count —— 带了游标数出来的是「剩余条数」，
      * 而 total 的语义是「当前筛选条件下的总数」。所以在这里把
      * 纯筛选条件先冻结一份，游标和 limit 只作用于取数那条 SQL。
@@ -167,7 +185,12 @@ export async function registerResourceRoutes(app: FastifyInstance): Promise<void
     const items = (hasMore ? rows.slice(0, limit) : rows).map(toSummary);
 
     const countRow = await q1<{ c: string }>(
-      `SELECT count(*)::text AS c FROM proxy_endpoints e WHERE ${filterWhere}`,
+      // count 必须和取数用同一套 JOIN：国家筛选条件落在 ip_assets 上，
+      // 少了这个 LEFT JOIN 会直接报 "missing FROM-clause entry for table i"，
+      // 而那是一个 500，不是"筛选没生效"。
+      `SELECT count(*)::text AS c FROM proxy_endpoints e
+         LEFT JOIN ip_assets i ON i.id = e.ip_asset_id
+       WHERE ${filterWhere}`,
       filterParams,
     );
 

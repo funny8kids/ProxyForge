@@ -5,13 +5,15 @@ import { exec, q, q1 } from '../db/client.js';
 import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
-import { enqueueDueProbes, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
+import { backfillExitGeography } from '../modules/verification/geo.js';
+import { enqueueDueProbes, pruneFinishedJobs, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
 import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
 import { evaluateAlerts } from '../modules/events/evaluate.js';
 import { recomputeSourceQuality } from '../modules/source/quality.js';
 import { runIngestCycle } from '../modules/source/ingest.js';
+import { pruneStaleCandidates } from '../modules/source/promote.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -410,6 +412,11 @@ async function periodic(): Promise<void> {
       // 调度任务每 15 秒一条，一天就是 5760 行。不清理会让这张表
       // 变成第二个只增不减的日志表，而它的价值只在最近几轮。
       await pruneSchedulerJobs(7);
+      // 手工/池级任务保留更久（30 天）：那是人工操作的凭据，出问题时要能回溯。
+      await pruneFinishedJobs(30);
+      // 过期候选的物理删除。标记 stale 只是让它不再计入积压，行还在，
+      // 而候选表是永久增长的 —— 19 个源 × 每小时几百条，一年就是百万级。
+      await pruneStaleCandidates(30);
     }
 
     // 告警评估放在最后：它读的是上面几步刚写下的状态，
@@ -450,6 +457,16 @@ export function startWorker(): () => void {
       })
       .catch((err) => noteError('reclaim-startup', err));
   }
+
+  // 出口地理回填：`health_checks` 里早就存着真实的国家码，但从来没接到
+  // 端点与 IP 资产上，于是国家列、地区分布、订阅的地区标签全是空的。
+  // 新探测会自然补上，但存量端点要等 15–360 分钟一轮才轮到，界面会空一整天。
+  // 只处理 `ip_asset_id IS NULL` 的行，跑完之后这条查询就是空的。
+  void backfillExitGeography()
+    .then((n) => {
+      if (n > 0) console.log(`[worker] 出口地理回填 ${n} 个端点`);
+    })
+    .catch((err) => noteError('backfill-geo', err));
 
   void periodic();
   void tick();

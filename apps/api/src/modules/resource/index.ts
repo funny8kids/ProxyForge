@@ -46,6 +46,7 @@ interface Row {
   consecutive_successes: number | null;
   success: boolean | null;
   last_check_at: string | null;
+  connect_ok: boolean | null;
   total_count?: string;
 }
 
@@ -84,6 +85,7 @@ function toSummary(r: Row): EndpointSummary {
             jitterMs: r.jitter_ms,
             successRate24h: numOrNull(r.success_rate_24h),
             qualityScore: num(r.quality_score),
+            connectOk: r.connect_ok,
           },
   };
 }
@@ -94,7 +96,8 @@ const BASE_SELECT = `
          e.quality_score, e.tags, e.expected_country,
          e.last_verified_at, i.country_code, i.region,
          s.p50_ms, s.p95_ms, s.jitter_ms, s.success_rate_24h, s.last_success_at,
-         s.consecutive_failures, s.consecutive_successes, s.success, s.last_check_at
+         s.consecutive_failures, s.consecutive_successes, s.success, s.last_check_at,
+         s.connect_ok
   FROM proxy_endpoints e
   LEFT JOIN endpoint_health_state s ON s.endpoint_id = e.id
   LEFT JOIN ip_assets i ON i.id = e.ip_asset_id

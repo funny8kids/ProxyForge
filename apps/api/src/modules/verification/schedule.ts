@@ -38,8 +38,17 @@ export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   // VERIFIED（关键路径）的预算。实测：120/轮的晋级速度下，10 分钟复探
   // 让待验证队列涨到 3949 个，而其中九成是已经死掉的。
   PENDING_VERIFICATION: 30,
-  // 已经在坏，随时会掉 —— 这是最需要盯的一档
-  DEGRADED: 30,
+  // 已经在坏，随时会掉 —— 这是最需要盯的一档。
+  //
+  // 从 30 分钟降到 10 分钟。原因不是"它掉得快"，而是**恢复路径太长**：
+  // 一个节点从 DEGRADED 回到 HEALTHY 要连续两次成功（`cs >= 2`），
+  // 30 分钟一轮意味着最坏要等一小时。而实测发现单次失败里有一半是
+  // 误判（并发丢 SYN 导致的假 TCP_TIMEOUT），等于让一堆本来能用的节点
+  // 在订阅尾部待一小时。
+  //
+  // 负载上 DEGRADED 约 600 个 / 10 分钟 = 每分钟 60 个，探测吞吐有
+  // 800–900 个/分钟的余量，占得起。
+  DEGRADED: 10,
   // 过了第一次探测、还差一次连续成功才算 HEALTHY。
   // 这一档的**唯一**用途就是尽快凑出第二次确认，所以必须短：
   // 给 120 分钟的话，节点导入后两小时内一个都不会变成 HEALTHY，
@@ -215,6 +224,7 @@ const STALE_JOB_MINUTES = 10;
  * 用创建时间衡量年龄。回收与闸门都拿它跟同一个阈值比较，两处才真正同口径。
  */
 export const ACTIVE_JOB_PREDICATE = `status IN ('PENDING','RUNNING')
+       AND attempts < max_attempts
        AND COALESCE(started_at, created_at) > now() - interval '${STALE_JOB_MINUTES} minutes'`;
 
 /**
@@ -241,8 +251,18 @@ export async function reclaimStaleJobs(): Promise<number> {
          lease_owner = NULL,
          lease_expires_at = NULL,
          finished_at = now()
-     WHERE status IN ('PENDING','RUNNING')
-       AND COALESCE(started_at, created_at) < now() - interval '${STALE_JOB_MINUTES} minutes'`,
+     WHERE (
+             -- 超窗：进程被强杀留下的残骸
+             status IN ('PENDING','RUNNING')
+             AND COALESCE(started_at, created_at) < now() - interval '${STALE_JOB_MINUTES} minutes'
+           )
+        OR (
+             -- 重试耗尽却还挂在 PENDING 上：认领查询要求 attempts < max_attempts，
+             -- 所以它永远不会再跑一次。这种任务必须显式终结 ——
+             -- ACTIVE_JOB_PREDICATE 已经把它排除在"活跃"之外，
+             -- 但如果不标 FAILED，它会永远躺在列表里，界面上看是"排队中"。
+             status = 'PENDING' AND attempts >= max_attempts
+           )`,
   );
 }
 
@@ -381,9 +401,22 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
  * "重启后立刻恢复"该有的行为。
  */
 export async function reclaimAllRunning(): Promise<number> {
+  /**
+   * 孤儿任务直接判 **FAILED**，不是退回 PENDING。
+   *
+   * 退回 PENDING 看着更"温和"（任务还能被重跑），但它会踩上一个更糟的坑：
+   * `ACTIVE_JOB_PREDICATE` 把「PENDING 且 created_at 在 10 分钟内」也算作
+   * 正在跑（那是为了防止同一个端点被并发探多次）。于是被回收的孤儿任务
+   * 一边挡着 busy 守卫、一边自己又因为 `attempts` 已经用满而永远不会被
+   * 认领 —— 探测会静默停摆整整 10 分钟。实测每次重启都会撞上。
+   *
+   * 判 FAILED 之后：busy 守卫立刻放开，那些端点仍处于"到期"状态，
+   * 下一个调度周期会重新入队。半途而废的那批探测结果本来就丢了，
+   * 留着任务记录也只是噪音。
+   */
   return exec(
     `UPDATE verification_jobs
-     SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL, started_at = NULL
+     SET status = 'FAILED', lease_owner = NULL, lease_expires_at = NULL, finished_at = now()
      WHERE status = 'RUNNING'`,
   );
 }

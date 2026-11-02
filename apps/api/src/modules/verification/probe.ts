@@ -49,6 +49,37 @@ export interface ProbeResult {
 const DEFAULT_TIMEOUT = 4000;
 
 /**
+ * TCP 建连超时，和后面的应用层超时**分开**。
+ *
+ * 原来整条链共用 4 秒。实测「600 个待验证节点、128 并发」时单节点耗时
+ * p50 就是 4001ms —— 说明过半节点在吃满 TCP 的 4 秒，而它们绝大多数
+ * 只是端口被过滤（不回 RST，只能等超时）。探测预算几乎全烧在这里。
+ *
+ * 但 TCP 建连本质只是一次网络层 RTT。对 140 个已知可用（connect_ok=true）
+ * 的节点实测：
+ *
+ *     p50 20ms   p90 33ms   p95 35ms   p99 38ms   max 39ms
+ *
+ * 所以 4 秒是 100 倍余量，收紧它本身是对的。
+ *
+ * ## 为什么最终是 2500 而不是 1000
+ *
+ * 先按"实测最大值的 25 倍"取了 1 秒，结果**制造了大量假失败**：抓 30 个
+ * 最近一次记为 `TCP_TIMEOUT` 的节点用真实探测链重测，**28 个当场成功**，
+ * 其中 8 个还能建隧道。这些假失败会把健康节点成批打成 DEGRADED ——
+ * 实测 50 分钟内 HEALTHY 从 630 掉到 370，而其中一半是误杀。
+ *
+ * 根因是 **TCP 首包重传的定时器正好是 1 秒**。192 路并发下本地 NAT 会丢
+ * SYN，内核在 1 秒后重传；而我们的 1 秒超时抢在重传之前触发，于是一个
+ * 本来只需 20ms 的节点被判成不可达。超时必须**明显高于首个 RTO**，
+ * 否则等于把"丢一个 SYN"当成"节点已死"。
+ *
+ * 2500ms 同时满足两件事：高于 RTO（留一次重传机会），又比原来的 4 秒
+ * 少 37% 的死节点等待成本。
+ */
+const TCP_TIMEOUT = 2500;
+
+/**
  * 给任意 Promise 加超时。
  *
  * 原实现有两个致命问题，两个都会**杀掉整个进程**：
@@ -115,7 +146,7 @@ export async function probe(target: ProbeTarget, timeoutMs = DEFAULT_TIMEOUT): P
   const tcpStart = performance.now();
   let socket: Socket;
   try {
-    socket = await connectTcp(address, target.port, timeoutMs);
+    socket = await connectTcp(address, target.port, Math.min(TCP_TIMEOUT, timeoutMs));
     base.tcpMs = Math.round(performance.now() - tcpStart);
   } catch (err) {
     base.failedLayer = 2;
@@ -242,7 +273,7 @@ async function probeConnect(target: ProbeTarget, timeoutMs: number): Promise<boo
 
   let socket: Socket;
   try {
-    socket = await connectTcp(address, target.port, timeoutMs);
+    socket = await connectTcp(address, target.port, Math.min(TCP_TIMEOUT, timeoutMs));
   } catch {
     return false;
   }

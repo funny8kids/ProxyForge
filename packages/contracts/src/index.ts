@@ -151,6 +151,17 @@ export interface EndpointHealth {
   jitterMs: number | null;
   successRate24h: number | null;
   qualityScore: number;
+  /**
+   * 能否建立 CONNECT 隧道（即能否访问 HTTPS 站点）。
+   *
+   * `null` = 还没测过。`false` = 只能转发明文 HTTP。
+   *
+   * 免费代理里存活节点约六成属于 `false` —— 它们在 Clash 里对绝大多数
+   * 站点完全不可用，但明文探测是成功的，所以质量分并不低。订阅渲染
+   * 会把它们剔除，界面也必须能看见这个字段，否则用户无法理解
+   * 「为什么显示 300 个健康节点，实际只有 70 多个能用」。
+   */
+  connectOk: boolean | null;
 }
 
 export interface EndpointSummary {
@@ -304,6 +315,16 @@ export interface VerificationJobRow {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /**
+   * 已认领次数与重试上限。
+   *
+   * 暴露出来是因为「任务停在 PENDING 却永远不跑」有两个完全不同的原因：
+   * `attempts` 用满（不会再被认领）与 `runAfter` 还在未来（没到点）。
+   * 界面上只看到 PENDING 的话，这两种情况长得一模一样。
+   */
+  attempts: number;
+  maxAttempts: number;
+  runAfter: string | null;
 }
 
 export interface VerificationRunRequest {

@@ -235,23 +235,47 @@ await check('刚启动的正常任务仍然挡住入队', async () => {
   await clearSchedulerJobs();
 });
 
-await check('重启时 RUNNING 任务被重置且清空 started_at', async () => {
-  // 只改 status 不清 started_at，会留下"PENDING 但带着旧 started_at"的行，
-  // 而 ACTIVE_JOB_PREDICATE 会把 10 分钟内的这种行当成仍在运行 ——
-  // 于是重启后照样要干等 10 分钟，正是这个函数存在的理由。
+await check('重启时 RUNNING 任务被判 FAILED，不再挡门', async () => {
+  /**
+   * 这里原本断言"重置成 PENDING 且清空 started_at"。那个写法有个隐蔽的
+   * 副作用：退回 PENDING 之后，`ACTIVE_JOB_PREDICATE` 仍然把
+   * 「PENDING 且 created_at 在 10 分钟内」算作正在跑（防止同一端点被并发
+   * 探多次），于是被回收的孤儿任务一边挡着 busy 守卫、一边又因为
+   * `attempts` 用满而永远不会被认领 —— 探测静默停摆整整 10 分钟。
+   *
+   * 实测每次重启都撞上：日志一行「探测暂停：上一个调度任务 xxx 仍在运行」，
+   * 然后 10 分钟里什么都不发生。
+   *
+   * 判 FAILED 才是正确语义：进程死在半路，那批结果本来就丢了；
+   * 端点仍处于到期状态，下一个调度周期会重新入队。
+   */
   const job = await mkStuckJob('RUNNING', 0);
   const { reclaimAllRunning } = await import('../apps/api/src/modules/verification/schedule.js');
   await reclaimAllRunning();
 
-  const row = await q1<{ status: string; started_at: string | null }>(
-    'SELECT status, started_at FROM verification_jobs WHERE id = $1',
+  const row = await q1<{ status: string; finished_at: string | null }>(
+    'SELECT status, finished_at FROM verification_jobs WHERE id = $1',
     [job],
   );
-  assert.equal(row?.status, 'PENDING');
-  assert.equal(row?.started_at, null, 'started_at 必须清空，否则 claimJobs 认领后仍被当成超窗任务');
+  assert.equal(row?.status, 'FAILED', '孤儿任务必须终结，不能退回 PENDING');
+  assert.notEqual(row?.finished_at, null, '终结的任务要写 finished_at');
 
   await exec(`UPDATE verification_jobs SET status='SUCCEEDED', finished_at=now() WHERE id=$1`, [job]);
   await clearSchedulerJobs();
+});
+
+await check('重试耗尽的 PENDING 任务不挡门，且会被判 FAILED', async () => {
+  // attempts 用满之后 claimJobs 永远不会再认领它（条件要求 attempts < max_attempts）。
+  // 如果还让它算"活跃"，探测就被一个永远跑不了的任务挡死。
+  const job = await mkStuckJob('PENDING', 0);
+  await exec('UPDATE verification_jobs SET attempts = max_attempts WHERE id = $1', [job]);
+
+  const r = await enqueueDueProbes();
+  assert.equal(r.reason !== 'busy', true, '重试耗尽的 PENDING 任务不该挡住入队');
+
+  await clearSchedulerJobs();
+  const row = await q1<{ status: string }>('SELECT status FROM verification_jobs WHERE id = $1', [job]);
+  assert.equal(row?.status, 'FAILED', '重试耗尽的任务应被回收为 FAILED');
 });
 
 console.log('\n[2] 到期入队');
@@ -263,9 +287,11 @@ await check('HEALTHY 超过复探周期 → 入队', async () => {
   await clearSchedulerJobs();
 });
 
-await check('DEGRADED 超过 30 分钟 → 入队；未满 30 分钟的不入队', async () => {
-  const due = await mkEndpoint('DEGRADED', 45);
-  const notDue = await mkEndpoint('DEGRADED', 20);
+await check('DEGRADED 超过 10 分钟 → 入队；未满 10 分钟的不入队', async () => {
+  // 周期从 30 分钟改成 10 分钟：DEGRADED → HEALTHY 要连续两次成功，
+  // 30 分钟一轮意味着误判的节点要在订阅尾部待一小时。
+  const due = await mkEndpoint('DEGRADED', 15);
+  const notDue = await mkEndpoint('DEGRADED', 5);
   const r = await enqueueDueProbes();
   const ids = await jobEndpointIds(r.jobId!);
   assert.ok(ids.includes(due));

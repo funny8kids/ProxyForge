@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
+    "dev": "tsx watch --ignore \"../../packages/contracts/dist/**\" --ignore \"../../.data/**\" src/main.ts",
     "dev:worker": "tsx watch src/worker/main.ts",
     "start": "node dist/main.js",
     "start:worker": "node dist/worker/main.js",
@@ -13,7 +13,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
-    "db:reset": "tsx src/db/reset.ts"
+    "db:reset": "tsx src/db/reset.ts",
+    "db:check": "tsx src/db/check.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.2.17",

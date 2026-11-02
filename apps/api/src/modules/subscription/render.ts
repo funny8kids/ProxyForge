@@ -39,6 +39,122 @@ export interface Rendered {
   format: ExportFormat;
 }
 
+/**
+ * 分流模式。
+ *
+ *   global —— 所有流量走代理（默认，最省心）
+ *   rule   —— 国内直连、其余走代理（日常最常用）
+ *   direct —— 全部直连（排障用：用来判断"是不是代理本身坏了"）
+ */
+export type RoutingMode = 'global' | 'rule' | 'direct';
+
+export interface RenderOptions {
+  routingMode?: RoutingMode;
+  /** 追加规则。统一用 mihomo 的 `TYPE,VALUE,ACTION` 行语法，两种格式都能转 */
+  extraRules?: string[];
+}
+
+/**
+ * rule 模式的内建规则。
+ *
+ * 顺序有意义：域名后缀优先于 GEOIP —— GEOIP 需要先解析出 IP，
+ * 而 `DOMAIN-SUFFIX,cn` 在 DNS 阶段就能分流，少一次查询。
+ * 内网段全部带 `no-resolve`，否则客户端会为了匹配 IP 规则去解析内网域名，
+ * 在没有 DNS 的环境下每次请求都要等超时。
+ */
+const RULE_MODE_RULES = [
+  'DOMAIN-SUFFIX,cn,DIRECT',
+  'GEOIP,CN,DIRECT',
+  'DOMAIN-SUFFIX,local,DIRECT',
+  'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
+  'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+  'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+  'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+];
+
+// ─────────────────────────────────────────────────────────────
+// 规则行解析
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 规则动作。
+ *
+ * 只有三种。用户手写的 `PROXY` / `节点选择` / `自动选择` 之类一律归到 `PROXY`，
+ * 因为一份订阅里只有一个组 —— 让用户随手写组名，写错就是客户端整份配置
+ * 加载失败，而报错信息通常只说"proxy group not found"，定位不到是哪条规则。
+ * 归一化之后，写错的规则最多是"没按预期分流"，不会让配置打不开。
+ */
+type RuleAction = 'DIRECT' | 'REJECT' | 'PROXY';
+
+interface ParsedRule {
+  type: string;
+  value: string;
+  action: RuleAction;
+  noResolve: boolean;
+}
+
+function actionOf(raw: string | undefined): RuleAction {
+  const k = (raw ?? '').trim().toUpperCase();
+  if (k === 'DIRECT') return 'DIRECT';
+  if (k === 'REJECT' || k === 'REJECT-DROP' || k === 'REJECT-TINYGIF') return 'REJECT';
+  return 'PROXY';
+}
+
+/**
+ * 解析一行 mihomo 语法规则。
+ *
+ * 刻意**不做白名单校验**：合法规则类型随内核版本增长，写死白名单会让新语法
+ * 在订阅里静默消失。这里只拦掉不可能被解析的行（空行、注释、缺值），
+ * 其余交给下游 —— mihomo 自己认识就生效，sing-box 不认识的会记进
+ * `_proxyforge.ignoredRules` 而不是被无声丢弃。
+ */
+function parseRule(line: string): ParsedRule | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const parts = trimmed.split(',').map((s) => s.trim());
+  const type = (parts[0] ?? '').toUpperCase();
+  if (!type) return null;
+  // MATCH 没有值段：`MATCH,PROXY`
+  if (type === 'MATCH') return { type, value: '', action: actionOf(parts[1]), noResolve: false };
+  const value = parts[1] ?? '';
+  if (!value) return null;
+  return {
+    type,
+    value,
+    action: actionOf(parts[2]),
+    noResolve: parts.slice(2).some((p) => p.toLowerCase() === 'no-resolve'),
+  };
+}
+
+/**
+ * 组装最终规则表。
+ *
+ * 用户规则在前、内建规则在后、`MATCH` 收尾 —— 这是唯一能保证
+ * "用户想覆盖的能覆盖、没覆盖的走默认"的顺序。direct 模式下同样保留用户规则：
+ * 用户既然写了规则，说明有明确意图，不该被模式开关吞掉。
+ */
+function buildRules(poolKey: string, routingMode: RoutingMode, extraRules: string[]): ParsedRule[] {
+  const user = extraRules.map(parseRule).filter((r): r is ParsedRule => r !== null);
+  const tail: ParsedRule[] =
+    routingMode === 'direct'
+      ? [{ type: 'MATCH', value: '', action: 'DIRECT', noResolve: false }]
+      : routingMode === 'rule'
+        ? [
+            ...RULE_MODE_RULES.map(parseRule).filter((r): r is ParsedRule => r !== null),
+            { type: 'MATCH', value: '', action: 'PROXY', noResolve: false },
+          ]
+        : [{ type: 'MATCH', value: '', action: 'PROXY', noResolve: false }];
+  return [...user, ...tail];
+}
+
+function isRoutingMode(v: unknown): v is RoutingMode {
+  return v === 'global' || v === 'rule' || v === 'direct';
+}
+
+export function normalizeRoutingMode(v: unknown, fallback: RoutingMode = 'global'): RoutingMode {
+  return isRoutingMode(v) ? v : fallback;
+}
+
 export function isExportFormat(v: unknown): v is ExportFormat {
   return typeof v === 'string' && (EXPORT_FORMATS as string[]).includes(v);
 }
@@ -62,11 +178,14 @@ export function renderSubscription(
   poolKey: string,
   proxies: ExportProxy[],
   generatedAt = new Date().toISOString(),
+  options: RenderOptions = {},
 ): Rendered {
+  const routingMode = normalizeRoutingMode(options.routingMode);
+  const extraRules = options.extraRules ?? [];
   switch (format) {
     case 'singbox':
       return {
-        body: renderSingBox(poolKey, proxies, generatedAt),
+        body: renderSingBox(poolKey, proxies, generatedAt, routingMode, extraRules),
         contentType: 'application/json; charset=utf-8',
         extension: 'json',
         format,
@@ -89,7 +208,7 @@ export function renderSubscription(
     case 'mihomo':
     default:
       return {
-        body: renderMihomo(poolKey, proxies, generatedAt),
+        body: renderMihomo(poolKey, proxies, generatedAt, routingMode, extraRules),
         contentType: 'text/yaml; charset=utf-8',
         extension: 'yaml',
         format,
@@ -118,9 +237,13 @@ const MIHOMO_TYPE: Record<ProxyProtocol, string> = {
  * 反过来，`1.2.3.4` 这种 IP **不能**被数字规则误伤：
  * 数字字面量正则必须限制成最多一个小数点，否则每个 IPv4 都会变成 `server: "1.2.3.4"`。
  */
+function yamlQuoted(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 function yamlScalar(value: string): string {
   if (value === '') return '""';
-  const quote = (v: string): string => `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const quote = yamlQuoted;
 
   // 整数/浮点字面量：`8080` 会被解析成 int，`1.5` 成 float，
   // 而它们在这里的语义是字符串（主机名、密码）
@@ -133,12 +256,21 @@ function yamlScalar(value: string): string {
   return value;
 }
 
-export function renderMihomo(poolKey: string, proxies: ExportProxy[], generatedAt: string): string {
+export function renderMihomo(
+  poolKey: string,
+  proxies: ExportProxy[],
+  generatedAt: string,
+  routingMode: RoutingMode = 'global',
+  extraRules: string[] = [],
+): string {
   const lines: string[] = [];
+  const rules = buildRules(poolKey, routingMode, extraRules);
+
   lines.push('# ProxyForge subscription');
   lines.push(`# pool: ${poolKey}`);
   lines.push(`# generated: ${generatedAt}`);
   lines.push(`# nodes: ${proxies.length}`);
+  lines.push(`# routing: ${routingMode}`);
   // ── 客户端必须有的入站配置 ──
   // Clash / FlClash 把订阅当**整份配置**用，不是片段。只给 proxies +
   // proxy-groups + rules 的话，加载成功、界面显示"已连接"，但没有任何
@@ -146,9 +278,31 @@ export function renderMihomo(poolKey: string, proxies: ExportProxy[], generatedA
   // allow-lan 必须保持 false：这是公开代理池，别把监听器开到局域网上。
   lines.push('mixed-port: 7890');
   lines.push('allow-lan: false');
+  // mode 恒为 rule：三种分流档位的差异全部落在规则表上，不靠 mode 开关。
+  // 用 mode: direct 会让用户自写的规则一并失效，语义反而更含糊。
   lines.push('mode: rule');
   lines.push('log-level: warning');
   lines.push('ipv6: false');
+
+  // DNS 只在 rule 模式下有意义：GEOIP 规则要先解析域名。
+  // global 模式全量走代理，DNS 交给远端就行，多写一段只会多一处出错的地方。
+  if (routingMode === 'rule') {
+    lines.push('dns:');
+    lines.push('  enable: true');
+    lines.push('  ipv6: false');
+    // fake-ip：域名不落真实 IP，避免国内 DNS 污染影响 GEOIP 判定
+    lines.push('  enhanced-mode: fake-ip');
+    lines.push('  fake-ip-range: 198.18.0.1/16');
+    lines.push('  default-nameserver:');
+    lines.push('    - 223.5.5.5');
+    lines.push('    - 119.29.29.29');
+    lines.push('  nameserver:');
+    lines.push('    - https://dns.alidns.com/dns-query');
+    lines.push('    - https://doh.pub/dns-query');
+    lines.push('  fallback:');
+    lines.push('    - https://1.1.1.1/dns-query');
+    lines.push('    - https://dns.google/dns-query');
+  }
 
   if (proxies.length === 0) {
     lines.push('# pool is empty');
@@ -158,6 +312,8 @@ export function renderMihomo(poolKey: string, proxies: ExportProxy[], generatedA
     lines.push('    type: select');
     lines.push('    proxies: []');
     lines.push('rules:');
+    // 空池不能 MATCH 到组：组里没有成员，客户端会一直转圈。
+    // 直连至少让人能用这份配置上网，同时一眼看出"池子是空的"。
     lines.push('  - MATCH,DIRECT');
     return `${lines.join('\n')}\n`;
   }
@@ -183,9 +339,21 @@ export function renderMihomo(poolKey: string, proxies: ExportProxy[], generatedA
   lines.push('    lazy: true');
   lines.push('    proxies:');
   for (const p of proxies) lines.push(`      - ${yamlScalar(p.name)}`);
+
   lines.push('rules:');
-  lines.push(`  - MATCH,${yamlScalar(poolKey)}`);
+  for (const r of rules) {
+    // 整行加引号：规则值里可能出现逗号（用户手写），
+    // 而 `MATCH,"a,b"` 这种半引用是坏 YAML —— 要么整行引用，要么不引用。
+    lines.push(`  - ${yamlQuoted(mihomoRuleLine(r, poolKey))}`);
+  }
   return `${lines.join('\n')}\n`;
+}
+
+function mihomoRuleLine(r: ParsedRule, poolKey: string): string {
+  const action = r.action === 'PROXY' ? poolKey : r.action;
+  if (r.type === 'MATCH') return `MATCH,${action}`;
+  const suffix = r.noResolve ? ',no-resolve' : '';
+  return `${r.type},${r.value},${action}${suffix}`;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -225,13 +393,100 @@ function singboxOutbound(p: ExportProxy, tag: string): Record<string, unknown> {
   return o;
 }
 
-export function renderSingBox(poolKey: string, proxies: ExportProxy[], generatedAt: string): string {
+/**
+ * mihomo 规则类型 → sing-box 匹配字段。
+ *
+ * 只覆盖有直接对应关系的。`RULE-SET` / `SRC-IP-SUFFIX` / `AND` 这类
+ * 结构上不一样的不做强行映射 —— 映射错了比不映射更糟：配置能加载，
+ * 但分流悄悄失效，用户只会觉得"代理偶尔不通"。
+ */
+const SINGBOX_MATCH: Record<string, string> = {
+  DOMAIN: 'domain',
+  'DOMAIN-SUFFIX': 'domain_suffix',
+  'DOMAIN-KEYWORD': 'domain_keyword',
+  'DOMAIN-REGEX': 'domain_regex',
+  'IP-CIDR': 'ip_cidr',
+  'IP-CIDR6': 'ip_cidr',
+  'SRC-IP-CIDR': 'source_ip_cidr',
+  'SRC-PORT': 'source_port',
+  'DST-PORT': 'port',
+  'PROCESS-NAME': 'process_name',
+  'PROCESS-PATH': 'process_path',
+};
+
+/**
+ * 规则表 → sing-box route.rules。
+ *
+ * `GEOIP` / `GEOSITE` 走 rule_set 而不是 `geoip` 字段：后者在 sing-box 1.12
+ * 已被移除，写了等于让配置在新版本上直接起不来。rule_set 的 URL 用
+ * SagerNet 官方发布的 .srs，客户端首次启动会下载一次，之后本地缓存。
+ */
+function singboxRoute(
+  rules: ParsedRule[],
+  poolKey: string,
+  hasProxy: boolean,
+): { rules: Record<string, unknown>[]; ruleSets: Record<string, unknown>[]; ignored: string[]; final: string } {
+  const out: Record<string, unknown>[] = [];
+  const ruleSets: Record<string, unknown>[] = [];
+  const ignored: string[] = [];
+
+  const outboundOf = (a: RuleAction): string =>
+    a === 'DIRECT' ? 'direct' : a === 'REJECT' ? 'block' : hasProxy ? poolKey : 'direct';
+
+  const ensureSet = (kind: 'geoip' | 'geosite', name: string): string => {
+    const tag = `${kind}-${name.toLowerCase()}`;
+    if (!ruleSets.some((s) => s['tag'] === tag)) {
+      const repo = kind === 'geoip' ? 'sing-geoip' : 'sing-geosite';
+      ruleSets.push({
+        type: 'remote',
+        tag,
+        format: 'binary',
+        url: `https://raw.githubusercontent.com/SagerNet/${repo}/rule-set/${tag}.srs`,
+        // 下载走代理：这两个仓库在部分网络环境下直连不通，
+        // 而 rule_set 拉不下来会导致整份配置加载失败。
+        download_detour: hasProxy ? poolKey : 'direct',
+      });
+    }
+    return tag;
+  };
+
+  let final = hasProxy ? poolKey : 'direct';
+  for (const r of rules) {
+    if (r.type === 'MATCH') {
+      // MATCH 是兜底，落在 route.final 上，不是一条规则
+      final = outboundOf(r.action);
+      continue;
+    }
+    const outbound = outboundOf(r.action);
+    if (r.type === 'GEOIP' || r.type === 'GEOSITE') {
+      const kind = r.type === 'GEOIP' ? 'geoip' : 'geosite';
+      out.push({ rule_set: ensureSet(kind, r.value), outbound });
+      continue;
+    }
+    const field = SINGBOX_MATCH[r.type];
+    if (!field) {
+      ignored.push(`${r.type},${r.value}`);
+      continue;
+    }
+    out.push({ [field]: [r.value], outbound });
+  }
+  return { rules: out, ruleSets, ignored, final };
+}
+
+export function renderSingBox(
+  poolKey: string,
+  proxies: ExportProxy[],
+  generatedAt: string,
+  routingMode: RoutingMode = 'global',
+  extraRules: string[] = [],
+): string {
   const tags = proxies.map((p, i) => p.name || `pf-${String(i + 1).padStart(2, '0')}`);
+  const hasProxy = tags.length > 0;
 
   const outbounds: Record<string, unknown>[] = proxies.map((p, i) => singboxOutbound(p, tags[i]!));
 
   // selector 不能为空数组，否则 sing-box 启动直接报错。
-  if (tags.length > 0) {
+  if (hasProxy) {
     outbounds.push({
       type: 'selector',
       tag: poolKey,
@@ -242,13 +497,29 @@ export function renderSingBox(poolKey: string, proxies: ExportProxy[], generated
   outbounds.push({ type: 'direct', tag: 'direct' });
   outbounds.push({ type: 'block', tag: 'block' });
 
+  const route = singboxRoute(buildRules(poolKey, routingMode, extraRules), poolKey, hasProxy);
+
   const config = {
     // 注释只能放在自定义字段里：JSON 不支持注释，
     // 而 sing-box 会忽略不认识的顶层键。
-    _proxyforge: { pool: poolKey, generated: generatedAt, nodes: proxies.length },
+    _proxyforge: {
+      pool: poolKey,
+      generated: generatedAt,
+      nodes: proxies.length,
+      routing: routingMode,
+      // 被丢掉的上游规则要显式列出来。静默丢弃会让"我明明写了规则"变成
+      // 一个无从排查的悬案。
+      ...(route.ignored.length ? { ignoredRules: route.ignored } : {}),
+    },
     log: { level: 'warn', timestamp: true },
     dns: {
-      servers: [{ tag: 'dns-remote', address: 'https://1.1.1.1/dns-query', detour: tags.length ? poolKey : 'direct' }],
+      servers: [
+        {
+          tag: 'dns-remote',
+          address: 'https://1.1.1.1/dns-query',
+          detour: hasProxy && route.final !== 'direct' ? poolKey : 'direct',
+        },
+      ],
     },
     inbounds: [
       {
@@ -260,9 +531,10 @@ export function renderSingBox(poolKey: string, proxies: ExportProxy[], generated
     ],
     outbounds,
     route: {
-      rules: [],
+      ...(route.ruleSets.length ? { rule_set: route.ruleSets } : {}),
+      rules: route.rules,
       // 池为空时不能指向一个不存在的 selector，否则配置加载即失败
-      final: tags.length ? poolKey : 'direct',
+      final: route.final,
       auto_detect_interface: true,
     },
   };

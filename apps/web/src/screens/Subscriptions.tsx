@@ -1,11 +1,16 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { Badge, Drawer, Empty, ErrorNote, Panel, Skeleton } from '../components/ui';
 import { api, ApiError } from '../lib/api';
 import { useAsync } from '../lib/useAsync';
 import { useI18n } from '../lib/i18n';
 import { relativeTime } from '../lib/format';
-import type { SubscriptionRow } from '@proxyforge/contracts';
+import type {
+  ProxyProtocol,
+  SubscriptionNodeFilter,
+  SubscriptionRow,
+  SubscriptionRoutingMode,
+} from '@proxyforge/contracts';
 
 /** 创建成功后拿到的一次性明文 Token。库里只有 sha256，丢了只能重签发。 */
 interface Issued {
@@ -52,13 +57,35 @@ const FORMATS: Array<{ value: string; label: string; client: string; ext: string
 
 const formatLabel = (v: string): string => FORMATS.find((f) => f.value === v)?.label ?? v;
 
-export function Subscriptions(): JSX.Element {
-  const { t, lang } = useI18n();
+/**
+ * 三档分流。
+ *
+ * 不提供更多档位（比如"自定义规则模式"）：模式决定的是**内建规则集**，
+ * 想更细的控制应该写在追加规则里 —— 那里能表达任何规则，而模式只是
+ * 三个常用预设。档位一多，用户就得先理解规则引擎才能选。
+ */
+const ROUTING_MODES: Array<{ value: SubscriptionRoutingMode; label: string; hint: string }> = [
+  { value: 'global', label: 'Global', hint: 'All traffic through the proxy' },
+  { value: 'rule', label: 'Rule', hint: 'China direct, everything else proxied' },
+  { value: 'direct', label: 'Direct', hint: 'Everything direct — use it to isolate whether the proxy is the problem' },
+];
+
+const ALL_PROTOCOLS: ProxyProtocol[] = ['SOCKS5', 'SOCKS4', 'HTTPS_CONNECT', 'HTTP'];
+
+const PROTOCOL_LABEL: Record<ProxyProtocol, string> = {
+  SOCKS5: 'SOCKS5',
+  SOCKS4: 'SOCKS4',
+  HTTPS_CONNECT: 'HTTPS',
+  HTTP: 'HTTP',
+};
+
+export function Subscriptions(): JSX.Element {  const { t, lang } = useI18n();
   const { data, error, loading, reload } = useAsync(() => api.subscriptions(), []);
   const [creating, setCreating] = useState(false);
   const [issued, setIssued] = useState<Issued | null>(null);
   const [rotating, setRotating] = useState<SubscriptionRow | null>(null);
   const [exporting, setExporting] = useState<SubscriptionRow | null>(null);
+  const [editing, setEditing] = useState<SubscriptionRow | null>(null);
 
   const items = data?.items ?? [];
 
@@ -116,6 +143,18 @@ export function Subscriptions(): JSX.Element {
                     </td>
                     <td>
                       <span className="chip">{s.format}</span>
+                      {/*
+                        分流档位放在格式旁边，不单开一列 —— 表格已经有九列，
+                        再加一列在 1280 宽的窗口里会把操作按钮挤到换行。
+                        档位是"这份配置怎么用"的一部分，和格式同类。
+                      */}
+                      <span
+                        className="chip"
+                        style={{ marginLeft: 4 }}
+                        title={t(ROUTING_MODES.find((m) => m.value === s.routingMode)?.hint ?? '')}
+                      >
+                        {s.routingMode}
+                      </span>
                     </td>
                     <td className="mono" style={{ fontSize: 11.5 }}>
                       {s.tokenPrefix}…
@@ -151,6 +190,19 @@ export function Subscriptions(): JSX.Element {
                       >
                         <Icon name="download" size={13} />
                         {t('Export')}
+                      </button>
+                      {/*
+                        分流与过滤之前是"建完就定死"的：想换模式只能删了重建，
+                        而重建会换掉 token（客户端要重新导入）并丢掉版本历史。
+                      */}
+                      <button
+                        className="btn ghost sm"
+                        style={{ marginLeft: 6 }}
+                        disabled={Boolean(s.revokedAt)}
+                        onClick={() => setEditing(s)}
+                        title={t('Routing & filtering')}
+                      >
+                        {t('Settings')}
                       </button>
                       {/*
                         明文 Token 只在创建时返回一次，界面上原本没有任何入口能把它拿回来。
@@ -241,6 +293,22 @@ export function Subscriptions(): JSX.Element {
       <IssuedDrawer issued={issued} onClose={() => setIssued(null)} />
 
       <ExportDrawer sub={exporting} onClose={() => setExporting(null)} />
+
+      {/*
+        key 用订阅 id：抽屉里的表单状态是从订阅行初始化的，
+        换一个订阅必须重新挂载，否则会拿着上一个订阅的值去保存。
+      */}
+      {editing && (
+        <SettingsDrawer
+          key={editing.id}
+          sub={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            reload();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -265,6 +333,9 @@ function CreateDrawer({
   const [poolId, setPoolId] = useState('');
   const [format, setFormat] = useState('mihomo');
   const [signing, setSigning] = useState(true);
+  // 分流档位在创建时就选好：默认 global 对大多数人不对，
+  // 而"建完再去设置里改"这一步没人会主动做。
+  const [routing, setRouting] = useState<SubscriptionRoutingMode>('rule');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -281,6 +352,7 @@ function CreateDrawer({
         poolId: pool,
         format,
         signingEnabled: signing,
+        routingMode: routing,
       });
       onIssued({ id: r.id, name: r.name, url: absoluteUrl(r.url), token: r.token, rotated: false, format });
       setName('clash');
@@ -356,6 +428,23 @@ function CreateDrawer({
           </span>
         </label>
 
+        <label className="field">
+          <span className="field-label">{t('Routing mode')}</span>
+          <div className="seg fixed" style={{ width: 'fit-content' }}>
+            {ROUTING_MODES.map((m) => (
+              <button
+                key={m.value}
+                className={routing === m.value ? 'on' : ''}
+                onClick={() => setRouting(m.value)}
+                title={t(m.hint)}
+              >
+                {t(m.label)}
+              </button>
+            ))}
+          </div>
+          <span className="field-hint">{t(ROUTING_MODES.find((m) => m.value === routing)?.hint ?? '')}</span>
+        </label>
+
         {err && <div className="form-error">{err}</div>}
       </div>
     </Drawer>
@@ -428,6 +517,363 @@ function RotateDrawer({
       </div>
     </Drawer>
   );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 分流与过滤
+// ─────────────────────────────────────────────────────────────
+
+interface PreviewState {
+  matched: number;
+  byProtocol: Record<string, number>;
+  sampleNames: string[];
+  loading: boolean;
+  error: string | null;
+}
+
+/**
+ * 分流与节点过滤。
+ *
+ * 两个设计决定值得说明：
+ *
+ * 1. **实时预览**。过滤条件是"盲配"的 —— 用户设 minQuality=80 时不知道还剩
+ *    几个节点。没有预览，唯一的反馈方式是保存后拉一次订阅，于是变成
+ *    "保存 → 发现是空的 → 再改"的循环。这里 400ms 防抖打一次预览接口。
+ *
+ * 2. **保存只改渲染字段**。不动 token、不动 revision 的语义 —— 内容变了
+ *    revision 会自然递增（服务端把分流设置算进了内容指纹），token 不变，
+ *    所以客户端不需要重新导入，下次拉取就拿到新配置。
+ */
+function SettingsDrawer({
+  sub,
+  onClose,
+  onSaved,
+}: {
+  sub: SubscriptionRow;
+  onClose: () => void;
+  onSaved: () => void;
+}): JSX.Element {
+  const { t } = useI18n();
+
+  const [mode, setMode] = useState<SubscriptionRoutingMode>(sub.routingMode);
+  const [protocols, setProtocols] = useState<ProxyProtocol[]>(sub.nodeFilter.protocols ?? []);
+  const [minQuality, setMinQuality] = useState(str(sub.nodeFilter.minQuality));
+  const [maxLatency, setMaxLatency] = useState(str(sub.nodeFilter.maxLatencyMs));
+  const [maxNodes, setMaxNodes] = useState(str(sub.nodeFilter.maxNodes));
+  const [excludeHosts, setExcludeHosts] = useState((sub.nodeFilter.excludeHosts ?? []).join(', '));
+  const [template, setTemplate] = useState(sub.nameTemplate ?? '');
+  const [rules, setRules] = useState(sub.extraRules.join('\n'));
+
+  const [preview, setPreview] = useState<PreviewState>({
+    matched: 0, byProtocol: {}, sampleNames: [], loading: true, error: null,
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  /** 组装请求体。预览与保存必须用**同一份**构造逻辑，否则预览的数字会骗人。 */
+  const buildBody = (): {
+    nodeFilter: SubscriptionNodeFilter;
+    nameTemplate: string | null;
+    routingMode: SubscriptionRoutingMode;
+    extraRules: string[];
+  } => {
+    const filter: SubscriptionNodeFilter = {};
+    if (protocols.length) filter.protocols = protocols;
+    const q = num(minQuality);
+    if (q !== undefined) filter.minQuality = q;
+    const l = num(maxLatency);
+    if (l !== undefined) filter.maxLatencyMs = l;
+    const n = num(maxNodes);
+    if (n !== undefined) filter.maxNodes = n;
+    const hosts = excludeHosts.split(/[,\s]+/).map((h) => h.trim()).filter(Boolean);
+    if (hosts.length) filter.excludeHosts = hosts;
+
+    return {
+      nodeFilter: filter,
+      nameTemplate: template.trim() || null,
+      routingMode: mode,
+      extraRules: rules.split('\n').map((r) => r.trim()).filter(Boolean),
+    };
+  };
+
+  // 依赖用序列化后的字符串：逐个列出 8 个变量既啰嗦又容易漏，
+  // 而漏一个的表现是"改了参数预览不更新"，很难注意到。
+  const sig = JSON.stringify([
+    mode, protocols, minQuality, maxLatency, maxNodes, excludeHosts, template, rules,
+  ]);
+
+  const seq = useRef(0);
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const mine = ++seq.current;
+      setPreview((p) => ({ ...p, loading: true, error: null }));
+      const body = buildBody();
+      void api
+        .previewSubscription({ poolId: sub.poolId, ...body })
+        .then((r) => {
+          // 乱序响应保护：慢的那次不能覆盖新结果
+          if (mine !== seq.current) return;
+          setPreview({
+            matched: r.matched,
+            byProtocol: r.byProtocol,
+            sampleNames: r.sampleNames,
+            loading: false,
+            error: null,
+          });
+        })
+        .catch((e: unknown) => {
+          if (mine !== seq.current) return;
+          setPreview({
+            matched: 0, byProtocol: {}, sampleNames: [], loading: false,
+            error: e instanceof ApiError ? e.message : String(e),
+          });
+        });
+    }, 400);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sig]);
+
+  const save = async (): Promise<void> => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.updateSubscription(sub.id, buildBody());
+      setSaved(true);
+      setTimeout(onSaved, 700);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  const toggleProtocol = (p: ProxyProtocol): void => {
+    setProtocols((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
+  };
+
+  const reset = (): void => {
+    setMode('global');
+    setProtocols([]);
+    setMinQuality('');
+    setMaxLatency('');
+    setMaxNodes('');
+    setExcludeHosts('');
+    setTemplate('');
+    setRules('');
+  };
+
+  const empty = !preview.loading && !preview.error && preview.matched === 0;
+
+  return (
+    <Drawer
+      open
+      onClose={onClose}
+      title={t('Routing & filtering')}
+      sub={`${sub.name} · ${sub.poolKey}`}
+      foot={
+        <>
+          <button className="btn primary sm" disabled={busy || saved || empty} onClick={save}>
+            {saved ? t('Saved') : busy ? t('Saving…') : t('Save')}
+          </button>
+          <button className="btn ghost sm" onClick={reset} disabled={busy}>
+            {t('Reset')}
+          </button>
+          <button className="btn ghost sm" style={{ marginLeft: 'auto' }} onClick={onClose}>
+            {t('Cancel')}
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid">
+        {/* ── 分流模式 ── */}
+        <label className="field">
+          <span className="field-label">{t('Routing mode')}</span>
+          <div className="seg fixed" style={{ width: 'fit-content' }}>
+            {ROUTING_MODES.map((m) => (
+              <button
+                key={m.value}
+                className={mode === m.value ? 'on' : ''}
+                onClick={() => setMode(m.value)}
+                title={t(m.hint)}
+              >
+                {t(m.label)}
+              </button>
+            ))}
+          </div>
+          <span className="field-hint">{t(ROUTING_MODES.find((m) => m.value === mode)?.hint ?? '')}</span>
+        </label>
+
+        {/* ── 协议 ── */}
+        <div className="field">
+          <span className="field-label">{t('Protocols')}</span>
+          <div className="seg" style={{ flexWrap: 'wrap', width: 'fit-content' }}>
+            {ALL_PROTOCOLS.map((p) => (
+              <button
+                key={p}
+                className={protocols.includes(p) ? 'on' : ''}
+                onClick={() => toggleProtocol(p)}
+              >
+                {PROTOCOL_LABEL[p]}
+              </button>
+            ))}
+          </div>
+          <span className="field-hint">
+            {protocols.length === 0
+              ? t('None selected means all protocols')
+              : t('Only the selected protocols are published')}
+          </span>
+        </div>
+
+        {/* ── 数值条件 ── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <label className="field">
+            <span className="field-label">{t('Min quality')}</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              max={100}
+              placeholder="0"
+              value={minQuality}
+              onChange={(e) => setMinQuality(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">{t('Max latency')}</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              placeholder="ms"
+              value={maxLatency}
+              onChange={(e) => setMaxLatency(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">{t('Max nodes')}</span>
+            <input
+              className="input"
+              type="number"
+              min={1}
+              max={200}
+              placeholder="200"
+              value={maxNodes}
+              onChange={(e) => setMaxNodes(e.target.value)}
+            />
+          </label>
+        </div>
+        <span className="field-hint" style={{ marginTop: -6 }}>
+          {t('Max latency drops nodes that have never been probed — "unknown" is not "fast".')}
+        </span>
+
+        <label className="field">
+          <span className="field-label">{t('Exclude hosts')}</span>
+          <input
+            className="input"
+            placeholder="amazonaws, digitalocean"
+            value={excludeHosts}
+            onChange={(e) => setExcludeHosts(e.target.value)}
+          />
+          <span className="field-hint">{t('Substring match, comma separated')}</span>
+        </label>
+
+        {/* ── 命名 ── */}
+        <label className="field">
+          <span className="field-label">{t('Name template')}</span>
+          <input
+            className="input"
+            placeholder="{pool}-{protocol}-{index}"
+            value={template}
+            onChange={(e) => setTemplate(e.target.value)}
+          />
+          <span className="field-hint">
+            {t('Placeholders: {index} {protocol} {host} {port} {pool}. Duplicates get a suffix.')}
+          </span>
+        </label>
+
+        {/* ── 追加规则 ── */}
+        <label className="field">
+          <span className="field-label">{t('Append rules')}</span>
+          <textarea
+            className="textarea"
+            rows={4}
+            placeholder={'DOMAIN-SUFFIX,example.com,DIRECT\nIP-CIDR,203.0.113.0/24,REJECT'}
+            value={rules}
+            onChange={(e) => setRules(e.target.value)}
+          />
+          <span className="field-hint">
+            {t(
+              'One rule per line, mihomo syntax. They run before the built-in rules. Any action other than DIRECT / REJECT means "go through this pool".',
+            )}
+          </span>
+        </label>
+
+        {/* ── 预览 ── */}
+        <div className="field">
+          <span className="field-label">
+            {t('Preview')}
+            <span className="num" style={{ marginLeft: 6, color: preview.loading ? 'var(--text-3)' : 'var(--text)' }}>
+              {preview.loading ? '…' : preview.matched}
+            </span>
+            <span style={{ marginLeft: 4, color: 'var(--text-3)', fontWeight: 400 }}>
+              {t('nodes')}
+            </span>
+          </span>
+          {preview.error ? (
+            <div className="form-error">{preview.error}</div>
+          ) : (
+            <div className="kv-note">
+              <div>
+                <span>{t('By protocol')}</span>
+                <span style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  {Object.entries(preview.byProtocol).length === 0 ? (
+                    <span className="mono">—</span>
+                  ) : (
+                    Object.entries(preview.byProtocol).map(([p, n]) => (
+                      <span className="chip" key={p}>
+                        {p} {n}
+                      </span>
+                    ))
+                  )}
+                </span>
+              </div>
+              <div>
+                <span>{t('Sample names')}</span>
+                <span className="mono" style={{ fontSize: 10.5, textAlign: 'right', overflowWrap: 'anywhere' }}>
+                  {preview.sampleNames.slice(0, 4).join(' · ') || '—'}
+                </span>
+              </div>
+            </div>
+          )}
+          {empty && (
+            <div className="warn-note">
+              {t('No node matches this filter. Loosen the conditions before saving.')}
+            </div>
+          )}
+        </div>
+
+        {err && <div className="form-error">{err}</div>}
+
+        <div className="info-note">
+          {t(
+            'The token stays the same, so clients do not need to be re-imported. Revision bumps automatically because the rendered content changed.',
+          )}
+        </div>
+      </div>
+    </Drawer>
+  );
+}
+
+/** 空串表示"不限" —— 不能当成 0，否则 minQuality=0 和"没填"会混成同一个意思 */
+function num(v: string): number | undefined {
+  const s = v.trim();
+  if (!s) return undefined;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function str(v: number | undefined): string {
+  return v === undefined ? '' : String(v);
 }
 
 // ─────────────────────────────────────────────────────────────

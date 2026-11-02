@@ -1,4 +1,4 @@
-import { getDb } from './client.js';
+import { closeDb, getDb } from './client.js';
 import { migrate } from './migrate.js';
 import { seed } from './seed.js';
 
@@ -19,5 +19,6 @@ const entry = process.argv[1];
 if (entry?.endsWith('reset.ts') || entry?.endsWith('reset.js')) {
   await reset();
   console.log('完成。');
+  await closeDb();
   process.exit(0);
 }

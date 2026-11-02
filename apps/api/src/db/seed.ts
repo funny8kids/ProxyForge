@@ -1,4 +1,4 @@
-import { exec, q, q1, tx } from './client.js';
+import { closeDb, exec, q, q1, tx } from './client.js';
 import { migrate } from './migrate.js';
 import { hashPassword, seal, sha256Hex, generateSigningKeyPair } from '../shared/crypto.js';
 import { uuidv7 } from '../shared/id.js';
@@ -560,5 +560,6 @@ export async function seed(): Promise<void> {
 const entry = process.argv[1];
 if (entry?.endsWith('seed.ts') || entry?.endsWith('seed.js')) {
   await seed();
+  await closeDb();
   process.exit(0);
 }

@@ -22,7 +22,10 @@
     "build": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api build && npm run -w @proxyforge/web build",
     "typecheck": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api typecheck && npm run -w @proxyforge/web typecheck",
     "verify": "node scripts/verify.mjs",
-    "test:engine": "node node_modules/tsx/dist/cli.mjs scripts/gateway-engine.test.mts"
+    "test:engine": "node node_modules/tsx/dist/cli.mjs scripts/gateway-engine.test.mts",
+    "test:render": "node node_modules/tsx/dist/cli.mjs scripts/subscription-render.test.mts",
+    "db:check": "npm run -w @proxyforge/api db:check",
+    "db:query": "node node_modules/tsx/dist/cli.mjs scripts/db-query.mts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

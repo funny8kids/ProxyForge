@@ -1,6 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import { loadMigrationFiles } from '../config.js';
-import { exec, getDb, q } from './client.js';
+import { closeDb, exec, getDb, q } from './client.js';
 
 /**
  * 迁移执行器。
@@ -56,5 +56,8 @@ if (entry && import.meta.url === pathToFileURL(entry).href) {
   console.log('运行迁移…');
   const res = await migrate();
   console.log(`完成：应用 ${res.applied.length} 个，跳过 ${res.skipped.length} 个`);
+  // 必须关库再退出：PGlite 是嵌入式 Postgres，直接 exit 会丢 WAL 尾巴，
+  // 下次启动就是 could not locate a valid checkpoint record，只能删库重建。
+  await closeDb();
   process.exit(0);
 }

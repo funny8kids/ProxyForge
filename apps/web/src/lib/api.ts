@@ -18,6 +18,8 @@ import type {
   SourceSyncOutcome,
   SubscriptionRow,
   SubscriptionCreated,
+  SubscriptionNodeFilter,
+  SubscriptionRoutingMode,
   SystemStatus,
   TrustSummary,
   VerificationJobRow,
@@ -224,7 +226,47 @@ export const api = {
     poolId: string;
     format?: string;
     signingEnabled?: boolean;
+    nodeFilter?: SubscriptionNodeFilter;
+    nameTemplate?: string | null;
+    routingMode?: SubscriptionRoutingMode;
+    extraRules?: string[];
   }) => post<SubscriptionCreated>('/subscriptions', body),
+  /** 只改渲染相关字段；pool / token / revision 都不动。 */
+  updateSubscription: (
+    id: string,
+    body: {
+      name?: string;
+      format?: string;
+      nameTemplate?: string | null;
+      routingMode?: SubscriptionRoutingMode;
+      extraRules?: string[];
+      nodeFilter?: SubscriptionNodeFilter;
+      signingEnabled?: boolean;
+    },
+  ) => patch<{ ok: boolean; changed: boolean }>(`/subscriptions/${id}`, body),
+  /**
+   * 过滤条件预览。返回匹配数与协议分布 ——
+   * 否则用户设完 minQuality 只能"保存 → 拉取 → 发现是空的 → 再改"。
+   */
+  previewSubscription: (body: {
+    poolId: string;
+    nodeFilter?: SubscriptionNodeFilter;
+    nameTemplate?: string | null;
+    routingMode?: SubscriptionRoutingMode;
+    extraRules?: string[];
+    format?: string;
+    includeBody?: boolean;
+  }) =>
+    post<{
+      poolKey: string;
+      matched: number;
+      byProtocol: Record<string, number>;
+      sampleNames: string[];
+      format: string;
+      routingMode: string;
+      contentType?: string;
+      body?: string;
+    }>('/subscriptions/preview', body),
   /** 换掉 token_hash：旧 URL 立即失效，订阅本身与版本历史保留。 */
   rotateSubscriptionToken: (id: string) =>
     post<{ id: string; token: string; tokenPrefix: string; url: string; warning: string }>(

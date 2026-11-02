@@ -177,14 +177,47 @@ if (isMain) {
   // PGlite 是嵌入式单写者，第二个进程打开同一 data 目录会直接崩在 initdb。
   // 因此本地默认把 worker 循环挂在本进程内；换真 PG 后设 PF_WORKER_MODE=process
   // 即可恢复独立进程形态，代码路径不变。
+  let stopWorker: (() => void) | null = null;
   if (config.workerMode === 'embedded') {
     const { startWorker } = await import('./worker/main.js');
-    const stop = startWorker();
-    for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-      process.on(sig, () => {
-        stop();
-        void stopAllRuntimes().finally(() => process.exit(0));
-      });
-    }
+    stopWorker = startWorker();
+  }
+
+  /**
+   * 优雅退出。
+   *
+   * 这里必须 **closeDb()**：PGlite 是嵌入式 Postgres，`process.exit()` 时
+   * 未落盘的 WAL 尾巴直接丢掉，下次启动会以
+   * `PANIC: could not locate a valid checkpoint record` 崩掉，且无法修复 ——
+   * 只能删库重建。之前只在 embedded 模式注册处理器、且退出前不关库，
+   * 等于每次 Ctrl-C 都在赌运气。
+   *
+   * 顺序也有讲究：先停 worker（它还在写库），再停网关（它在写文件/端口），
+   * 最后关库。反过来会出现"关库之后 worker 还在跑 SQL"的报错噪音。
+   */
+  let shuttingDown = false;
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[api] 收到 ${signal}，正在停止…`);
+    void (async () => {
+      try {
+        stopWorker?.();
+      } catch { /* 停 worker 失败不应阻断关库 */ }
+      try {
+        await stopAllRuntimes();
+      } catch { /* 同上 */ }
+      try {
+        const { closeDb } = await import('./db/client.js');
+        await closeDb();
+        console.log('[api] 数据库已正常关闭');
+      } catch (err) {
+        console.error('[api] 关闭数据库失败：', err);
+      }
+      process.exit(0);
+    })();
+  };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(sig, () => shutdown(sig));
   }
 }

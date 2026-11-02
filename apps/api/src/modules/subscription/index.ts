@@ -1,5 +1,12 @@
 import type { FastifyInstance } from 'fastify';
-import type { ProxyProtocol, SubscriptionCreated, SubscriptionRow, TrustTier } from '@proxyforge/contracts';
+import type {
+  ProxyProtocol,
+  SubscriptionCreated,
+  SubscriptionNodeFilter,
+  SubscriptionRoutingMode,
+  SubscriptionRow,
+  TrustTier,
+} from '@proxyforge/contracts';
 import { exec, q, q1, tx } from '../../db/client.js';
 import { actorOf, guard } from '../auth/index.js';
 import { audit, emit, EVENT_TYPES } from '../../shared/events.js';
@@ -10,10 +17,13 @@ import { canonicalize } from '../../shared/jcs.js';
 import {
   EXPORT_FORMATS,
   normalizeFormat,
+  normalizeRoutingMode,
   renderSubscription,
   type ExportFormat,
   type ExportProxy,
+  type RoutingMode,
 } from './render.js';
+import { applyNameTemplate, applyNodeFilter, normalizeNodeFilter } from './filter.js';
 
 /**
  * 订阅渲染与签名（ADR-0008 / ADR-0009 / SEC-001 §6.4）
@@ -35,6 +45,10 @@ interface SubscriptionLookup {
   revision: string;
   expires_at: string | null;
   revoked_at: string | null;
+  node_filter: SubscriptionNodeFilter | null;
+  name_template: string | null;
+  routing_mode: string;
+  extra_rules: string[] | null;
 }
 
 interface EligibleEndpoint {
@@ -44,7 +58,41 @@ interface EligibleEndpoint {
   port: number;
   trust_tier: TrustTier;
   quality_score: string;
+  p50_ms: number | null;
   credential_ref: string | null;
+}
+
+/** 一行规则的长度上限。用户手写，但一份订阅不该被塞进一兆字节的规则。 */
+const MAX_RULE_LEN = 200;
+const MAX_RULES = 60;
+const MAX_TEMPLATE_LEN = 80;
+
+/**
+ * 校验并归一化规则行。
+ *
+ * 这里只做"能不能被解析"的检查，不校验规则类型白名单 —— 类型集合随内核
+ * 版本增长，写死会让新语法进不来。真正危险的输入是**超长行**和**海量行**：
+ * 它们会让渲染出来的配置体积失控，客户端加载变慢但不会报错，很难归因。
+ */
+function normalizeRules(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const line = String(item ?? '').trim();
+    if (!line || line.startsWith('#')) continue;
+    if (line.length > MAX_RULE_LEN) throw invalid(`规则过长（上限 ${MAX_RULE_LEN} 字符）：${line.slice(0, 40)}…`);
+    out.push(line);
+    if (out.length > MAX_RULES) throw invalid(`规则条数过多（上限 ${MAX_RULES} 条）`);
+  }
+  return out;
+}
+
+function normalizeTemplate(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const t = String(raw).trim();
+  if (!t) return null;
+  if (t.length > MAX_TEMPLATE_LEN) throw invalid(`命名模板过长（上限 ${MAX_TEMPLATE_LEN} 字符）`);
+  return t;
 }
 
 
@@ -70,6 +118,10 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
         lastAccessedAt: (r.last_accessed_at as string) ?? null,
         accessCount: Number(r.access_count),
         createdAt: String(r.created_at),
+        nodeFilter: normalizeNodeFilter(r.node_filter),
+        nameTemplate: (r.name_template as string) ?? null,
+        routingMode: normalizeRoutingMode(r.routing_mode),
+        extraRules: Array.isArray(r.extra_rules) ? (r.extra_rules as string[]) : [],
       })),
     };
   });
@@ -77,6 +129,7 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
   app.post('/subscriptions', { preHandler: guard('subscription:write') }, async (req): Promise<SubscriptionCreated> => {
     const body = req.body as {
       name: string; poolId: string; format?: string; signingEnabled?: boolean; expiresAt?: string;
+      nodeFilter?: unknown; nameTemplate?: unknown; routingMode?: unknown; extraRules?: unknown;
     };
     if (!body?.name) throw invalid('name 必填');
     if (!body?.poolId) throw invalid('poolId 必填');
@@ -87,6 +140,11 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
     if (body.format && !(EXPORT_FORMATS as string[]).includes(body.format)) {
       throw invalid(`format 不支持：${body.format}（可选 ${EXPORT_FORMATS.join(' / ')}）`);
     }
+
+    const nodeFilter = normalizeNodeFilter(body.nodeFilter);
+    const nameTemplate = normalizeTemplate(body.nameTemplate);
+    const routingMode = normalizeRoutingMode(body.routingMode);
+    const extraRules = normalizeRules(body.extraRules);
 
     const actor = actorOf(req);
     const pool = await q1<{ key: string }>('SELECT key FROM resource_pools WHERE id = $1', [body.poolId]);
@@ -106,18 +164,23 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
     await tx(async (t) => {
       await t.exec(
         `INSERT INTO subscriptions
-           (id, name, pool_id, format, token_hash, token_prefix, signing_enabled, expires_at, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           (id, name, pool_id, format, token_hash, token_prefix, signing_enabled, expires_at, created_by,
+            node_filter, name_template, routing_mode, extra_rules)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13::jsonb)`,
         [
           id, body.name, body.poolId, requestedFormat,
           sha256Hex(token), token.slice(0, 12), body.signingEnabled ?? false,
           body.expiresAt ?? null, actor.id,
+          JSON.stringify(nodeFilter), nameTemplate, routingMode, JSON.stringify(extraRules),
         ],
       );
       await audit(t, {
         actorType: actor.kind, actorId: actor.id, action: 'subscription.create',
         resourceType: 'subscription', resourceId: id,
-        afterState: { name: body.name, poolId: body.poolId, signingEnabled: body.signingEnabled ?? false },
+        afterState: {
+          name: body.name, poolId: body.poolId, signingEnabled: body.signingEnabled ?? false,
+          routingMode, nodeFilter, extraRules,
+        },
       });
     });
 
@@ -135,9 +198,149 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
       lastAccessedAt: null,
       accessCount: 0,
       createdAt: new Date().toISOString(),
+      nodeFilter,
+      nameTemplate,
+      routingMode,
+      extraRules,
       token,
       url: `/api/v1/subscriptions/${token}`,
       warning: 'Token 仅显示一次，请立即保存',
+    };
+  });
+
+  /**
+   * 修改订阅设置。
+   *
+   * 之前建完订阅就再也不能改 —— 想换分流模式或调节点上限只能删了重建，
+   * 而重建会丢掉 token（客户端要重新导入）和版本历史。
+   * 这里只允许改**渲染相关**字段，pool / token / revision 都不动。
+   */
+  app.patch('/subscriptions/:id', { preHandler: guard('subscription:write') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = (req.body ?? {}) as {
+      name?: string; format?: string; nameTemplate?: unknown; routingMode?: unknown;
+      extraRules?: unknown; nodeFilter?: unknown; signingEnabled?: boolean;
+    };
+    const actor = actorOf(req);
+
+    const existing = await q1<{ revoked_at: string | null }>(
+      'SELECT revoked_at FROM subscriptions WHERE id = $1',
+      [id],
+    );
+    if (!existing) throw notFound('订阅');
+    if (existing.revoked_at) throw invalid('订阅已撤销，无法修改');
+
+    const sets: string[] = [];
+    const params: unknown[] = [id];
+    const before: Record<string, unknown> = {};
+
+    const push = (column: string, value: unknown, cast = ''): void => {
+      params.push(value);
+      sets.push(`${column} = $${params.length}${cast}`);
+    };
+
+    if (body.name !== undefined) {
+      const name = String(body.name).trim();
+      if (!name) throw invalid('name 不能为空');
+      push('name', name);
+      before['name'] = name;
+    }
+    if (body.format !== undefined) {
+      if (!(EXPORT_FORMATS as string[]).includes(body.format)) {
+        throw invalid(`format 不支持：${body.format}（可选 ${EXPORT_FORMATS.join(' / ')}）`);
+      }
+      push('format', body.format);
+      before['format'] = body.format;
+    }
+    if (body.routingMode !== undefined) {
+      const mode = normalizeRoutingMode(body.routingMode);
+      push('routing_mode', mode);
+      before['routingMode'] = mode;
+    }
+    if (body.extraRules !== undefined) {
+      const rules = normalizeRules(body.extraRules);
+      push('extra_rules', JSON.stringify(rules), '::jsonb');
+      before['extraRules'] = rules;
+    }
+    if (body.nameTemplate !== undefined) {
+      const tpl = normalizeTemplate(body.nameTemplate);
+      push('name_template', tpl);
+      before['nameTemplate'] = tpl;
+    }
+    if (body.nodeFilter !== undefined) {
+      const filter = normalizeNodeFilter(body.nodeFilter);
+      push('node_filter', JSON.stringify(filter), '::jsonb');
+      before['nodeFilter'] = filter;
+    }
+    if (body.signingEnabled !== undefined) {
+      if (body.signingEnabled) {
+        const key = await q1(`SELECT 1 FROM signing_keys WHERE status = 'ACTIVE'`);
+        if (!key) throw new AppError('SIGNING_KEY_UNAVAILABLE', '已启用签名但无 ACTIVE 密钥，请先激活签名密钥');
+      }
+      push('signing_enabled', Boolean(body.signingEnabled));
+      before['signingEnabled'] = Boolean(body.signingEnabled);
+    }
+
+    if (sets.length === 0) return { ok: true, changed: false };
+
+    await tx(async (t) => {
+      await t.exec(`UPDATE subscriptions SET ${sets.join(', ')} WHERE id = $1`, params);
+      await audit(t, {
+        actorType: actor.kind, actorId: actor.id, action: 'subscription.update',
+        resourceType: 'subscription', resourceId: id, afterState: before,
+      });
+    });
+    return { ok: true, changed: true, applied: before };
+  });
+
+  /**
+   * 预览过滤结果。
+   *
+   * 存在的理由：过滤条件是"盲配"的 —— 用户设 minQuality=80 时无从知道
+   * 到底还剩几个节点，只有保存后拉一次订阅才能看见。结果是要么筛空了
+   * 才发现，要么反复试参数。这个接口让表单能实时回显"匹配 N 个节点"。
+   *
+   * 顺带把渲染结果也带回来（includeBody），省掉"保存 → 拉取 → 不满意 → 改"
+   * 这一圈往返。
+   */
+  app.post('/subscriptions/preview', { preHandler: guard('subscription:read') }, async (req) => {
+    const body = (req.body ?? {}) as {
+      poolId?: string; nodeFilter?: unknown; nameTemplate?: unknown; routingMode?: unknown;
+      extraRules?: unknown; format?: string; includeBody?: boolean;
+    };
+    if (!body.poolId) throw invalid('poolId 必填');
+    const pool = await q1<{ key: string }>('SELECT key FROM resource_pools WHERE id = $1', [body.poolId]);
+    if (!pool) throw notFound('资源池');
+
+    const nodeFilter = normalizeNodeFilter(body.nodeFilter);
+    const nameTemplate = normalizeTemplate(body.nameTemplate);
+    const routingMode = normalizeRoutingMode(body.routingMode);
+    const extraRules = normalizeRules(body.extraRules);
+
+    const proxies = await loadExportProxies(body.poolId, pool.key, {
+      node_filter: nodeFilter,
+      name_template: nameTemplate,
+    });
+
+    const byProtocol: Record<string, number> = {};
+    for (const p of proxies) byProtocol[p.protocol] = (byProtocol[p.protocol] ?? 0) + 1;
+
+    const format = normalizeFormat(body.format, 'mihomo');
+    const rendered = body.includeBody
+      ? renderSubscription(format, pool.key, proxies, undefined, { routingMode, extraRules })
+      : null;
+
+    return {
+      poolKey: pool.key,
+      matched: proxies.length,
+      byProtocol,
+      // 只回样本：整份名单没有额外信息量，还会让响应体随池子规模膨胀
+      sampleNames: proxies.slice(0, 10).map((p) => p.name),
+      format,
+      routingMode,
+      ...(rendered
+        ? { contentType: rendered.contentType, body: rendered.body.slice(0, 16_000) }
+        : {}),
     };
   });
 
@@ -228,17 +431,25 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
     const { id } = req.params as { id: string };
     const query = req.query as { format?: string; download?: string };
 
-    const sub = await q1<{ id: string; name: string; pool_id: string; pool_key: string; format: string; revoked_at: string | null }>(
-      `SELECT s.id, s.name, s.pool_id, p.key AS pool_key, s.format, s.revoked_at
+    const sub = await q1<{
+      id: string; name: string; pool_id: string; pool_key: string; format: string; revoked_at: string | null;
+      node_filter: SubscriptionNodeFilter | null; name_template: string | null;
+      routing_mode: string; extra_rules: string[] | null;
+    }>(
+      `SELECT s.id, s.name, s.pool_id, p.key AS pool_key, s.format, s.revoked_at,
+              s.node_filter, s.name_template, s.routing_mode, s.extra_rules
        FROM subscriptions s JOIN resource_pools p ON p.id = s.pool_id WHERE s.id = $1`,
       [id],
     );
     if (!sub) throw notFound('订阅');
     if (sub.revoked_at) throw invalid('订阅已撤销，无法导出');
 
-    const proxies = await loadExportProxies(sub.pool_id);
+    const proxies = await loadExportProxies(sub.pool_id, sub.pool_key, sub);
     const format = normalizeFormat(query.format, normalizeFormat(sub.format));
-    const rendered = renderSubscription(format, sub.pool_key, proxies);
+    const rendered = renderSubscription(format, sub.pool_key, proxies, undefined, {
+      routingMode: normalizeRoutingMode(sub.routing_mode),
+      extraRules: Array.isArray(sub.extra_rules) ? sub.extra_rules : [],
+    });
 
     reply.header('Content-Type', rendered.contentType);
     reply.header('Cache-Control', 'no-store');
@@ -259,7 +470,8 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
 
     const sub = await q1<SubscriptionLookup>(
       `SELECT s.id, s.name, s.pool_id, p.key AS pool_key, s.format, s.signing_enabled,
-              s.revision, s.expires_at, s.revoked_at
+              s.revision, s.expires_at, s.revoked_at,
+              s.node_filter, s.name_template, s.routing_mode, s.extra_rules
        FROM subscriptions s JOIN resource_pools p ON p.id = s.pool_id
        WHERE s.token_hash = $1`,
       [hash],
@@ -270,16 +482,25 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
     if (sub.expires_at && new Date(sub.expires_at) < new Date()) throw notFound('订阅');
 
     // 池的分级准入必须在这里再过一遍：订阅不能成为绕过 SEC-001 的通道
-    const proxies = await loadExportProxies(sub.pool_id);
+    const proxies = await loadExportProxies(sub.pool_id, sub.pool_key, sub);
+
+    const routingMode = normalizeRoutingMode(sub.routing_mode);
+    const extraRules = Array.isArray(sub.extra_rules) ? sub.extra_rules : [];
 
     // 内容指纹只覆盖**稳定字段**。
     // 把 issuedAt 算进指纹是个陷阱：它每次请求都变，会导致 revision 无限膨胀，
     // 且同一份内容每次拿到不同签名 —— 客户端缓存与验签都会失效。
+    //
+    // 分流设置必须算进来：它不改变节点集合，但改变了「发布内容」。
+    // 不算的话，用户改了分流模式，客户端拿到的仍是旧 revision，
+    // 部分客户端会认为"内容没变"而不重新拉取配置。
     const stable = {
       subscriptionId: sub.id,
       poolKey: sub.pool_key,
       format: sub.format,
       proxies,
+      routingMode,
+      extraRules,
     };
     const contentHash = sha256Hex(canonicalize(stable));
 
@@ -398,7 +619,9 @@ export async function registerSubscriptionRoutes(app: FastifyInstance): Promise<
     const q = req.query as { format?: string; download?: string };
     const envelope = q.format === 'json';
     const format = envelope ? null : normalizeFormat(q.format, normalizeFormat(sub.format));
-    const rendered = format ? renderSubscription(format, sub.pool_key, proxies) : null;
+    const rendered = format
+      ? renderSubscription(format, sub.pool_key, proxies, undefined, { routingMode, extraRules })
+      : null;
 
     reply.header('Content-Type', rendered?.contentType ?? 'text/yaml; charset=utf-8');
     reply.header('Cache-Control', 'private, max-age=300');
@@ -526,27 +749,39 @@ function contentDisposition(name: string, poolKey: string, format: string, ext: 
  * 这类问题会非常难查。
  *
  * 分级准入在这里再过一遍：订阅与导出都不能成为绕过 SEC-001 的通道。
+ *
+ * 过滤与命名也放在这里 —— 它们必须发生在**同一处**，否则两个入口
+ * 会因为"一个筛了一个没筛"而给出不同结果。
  */
-async function loadExportProxies(poolId: string): Promise<ExportProxy[]> {
+async function loadExportProxies(
+  poolId: string,
+  poolKey: string,
+  settings: { node_filter?: SubscriptionNodeFilter | null; name_template?: string | null } = {},
+): Promise<ExportProxy[]> {
   const pool = await q1<{ allowed_tiers: TrustTier[] }>(
     'SELECT allowed_tiers FROM resource_pools WHERE id = $1',
     [poolId],
   );
 
   const endpoints = await q<EligibleEndpoint>(
-    `SELECT v.id, v.protocol, v.host, v.port, v.trust_tier, v.quality_score, v.credential_ref
+    `SELECT v.id, v.protocol, v.host, v.port, v.trust_tier, v.quality_score, v.p50_ms, v.credential_ref
      FROM v_subscription_eligible_endpoints v
      JOIN resource_pool_members m ON m.endpoint_id = v.id AND m.pool_id = $1 AND m.suppressed = false
      WHERE v.trust_tier::text = ANY($2::text[])
-     ORDER BY v.quality_score DESC
-     LIMIT 200`,
+     ORDER BY v.quality_score DESC, v.p50_ms ASC NULLS LAST
+     LIMIT 500`,
     [poolId, pool?.allowed_tiers ?? []],
   );
+
+  // 过滤在取数之后：500 条内存筛选是微秒级，没必要把条件翻成动态 SQL ——
+  // 动态拼接的 WHERE 是这类接口最容易出的注入点。
+  const filter = normalizeNodeFilter(settings.node_filter);
+  const kept = applyNodeFilter(endpoints, filter);
 
   // 带认证的代理要把账号密码一并交给客户端，否则节点在 Clash 里永远是超时。
   // 凭据在库里是密文，这里一次性取出解密；解密失败不能拖垮整份订阅 ——
   // 一条坏凭据只让那一个节点不可用，其余照发。
-  const credRefs = [...new Set(endpoints.map((e) => e.credential_ref).filter((x): x is string => !!x))];
+  const credRefs = [...new Set(kept.map((e) => e.credential_ref).filter((x): x is string => !!x))];
   const creds = new Map<string, { username: string; password: string }>();
   if (credRefs.length > 0) {
     const rows = await q<{ ref: string; ciphertext: string; nonce: string; key_version: number }>(
@@ -570,7 +805,7 @@ async function loadExportProxies(poolId: string): Promise<ExportProxy[]> {
     }
   }
 
-  return endpoints.map((e, i) => {
+  const proxies = kept.map((e, i) => {
     const p: ExportProxy = {
       name: `pf-${String(i + 1).padStart(2, '0')}`,
       protocol: e.protocol,
@@ -584,4 +819,6 @@ async function loadExportProxies(poolId: string): Promise<ExportProxy[]> {
     }
     return p;
   });
+
+  return applyNameTemplate(proxies, settings.name_template, poolKey);
 }

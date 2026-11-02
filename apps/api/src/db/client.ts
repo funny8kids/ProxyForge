@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 
@@ -19,10 +19,39 @@ export async function getDb(): Promise<PGlite> {
     instance = new PGlite();
   } else {
     mkdirSync(config.databaseUrl, { recursive: true });
+    // 必须在**构造 PGlite 之前**拦住，不能等打开失败再判断：
+    // 第二个实例一旦开始初始化就会写坏 WAL，之后再抛错也已经晚了。
+    // 这个坑很贵 —— 现场是"数据库莫名其妙损坏"，而根因只是"忘了先停服务"。
+    const holder = dataDirHolder(config.databaseUrl);
+    if (holder !== null) throw heldByProcessError(holder, config.databaseUrl);
     instance = await openWithStaleLockRecovery(config.databaseUrl);
   }
   await instance.waitReady;
   return instance;
+}
+
+/** 数据目录是否被一个**活着的**进程占用；是则返回那个 pid */
+export function dataDirHolder(dataDir: string): number | null {
+  if (dataDir === 'memory://') return null;
+  const pid = lockHolderPid(join(dataDir, 'postmaster.pid'));
+  if (pid === null) return null;
+  return isAlive(pid) ? pid : null;
+}
+
+function heldByProcessError(pid: number, dataDir: string): Error {
+  return new Error(
+    [
+      `数据库被另一个进程占用：${dataDir}`,
+      `postmaster.pid 指向 pid ${pid}，该进程仍在运行。`,
+      '',
+      'PGlite 是嵌入式单写者：两个进程同时打开同一数据目录会把 WAL 写坏，',
+      '而且损坏之后无法修复（只能 db:reset）。所以这里直接拒绝，不冒险重试。',
+      '',
+      '先停掉那个进程再继续。查是谁占着：',
+      '  netstat -ano | findstr 8081     # 找 API 的 pid',
+      '  taskkill /PID <pid>             # 正常停（不要用 /F，强杀会丢 WAL）',
+    ].join('\n'),
+  );
 }
 
 /**
@@ -35,14 +64,24 @@ export async function getDb(): Promise<PGlite> {
  * 策略是「先正常开，失败才清理，且只清理一次」——
  * 不做启动前无条件删除，因为那会在真有进程持有时破坏现场。
  * 被移开的文件保留在 .data/stale-locks/ 下，不删，便于事后取证。
+ *
+ * 注意这里**只能**修锁文件。WAL 损坏（`could not locate a valid checkpoint
+ * record`）是另一类故障，清锁文件救不回来 —— 见 openFailureHint。
  */
 async function openWithStaleLockRecovery(dataDir: string): Promise<PGlite> {
   // 初始化失败不会在构造时抛，而是 reject 在 waitReady 上，
   // 所以必须把「构造 + 等待就绪」整体包进一次尝试里。
   const attempt = async (): Promise<PGlite> => {
     const db = new PGlite(dataDir);
-    await db.waitReady;
-    return db;
+    try {
+      await db.waitReady;
+      return db;
+    } catch (err) {
+      // waitReady 失败后 wasm 实例已不可用，必须显式释放，
+      // 否则重试时会同时存在两个实例抢同一个数据目录。
+      await db.close().catch(() => {});
+      throw err;
+    }
   };
 
   try {
@@ -50,7 +89,22 @@ async function openWithStaleLockRecovery(dataDir: string): Promise<PGlite> {
   } catch (err) {
     const locks = ['postmaster.pid', '.s.PGSQL.5432.lock.out', '.s.PGSQL.5432.lock'];
     const present = locks.filter((f) => existsSync(join(dataDir, f)));
-    if (present.length === 0) throw err;
+    if (present.length === 0) throw openFailureHint(err, dataDir);
+
+    // PGlite 即便 close() 正常退出也会留下 postmaster.pid，
+    // 所以"有锁文件"不等于"上次崩了"。真正的判据是里面的 pid 还活着没。
+    const holder = lockHolderPid(join(dataDir, 'postmaster.pid'));
+    if (holder !== null && isAlive(holder)) {
+      throw new Error(
+        [
+          `数据库被另一个进程占用：${dataDir}`,
+          `postmaster.pid 指向 pid ${holder}，该进程仍在运行。`,
+          '',
+          'PGlite 是单写者，两个进程打开同一数据目录必然崩在 initdb。',
+          '先停掉那个进程（npm run dev 是不是还开着？），再启动本进程。',
+        ].join('\n'),
+      );
+    }
 
     const graveyard = join(dataDir, '..', 'stale-locks');
     mkdirSync(graveyard, { recursive: true });
@@ -58,11 +112,65 @@ async function openWithStaleLockRecovery(dataDir: string): Promise<PGlite> {
     for (const f of present) {
       renameSync(join(dataDir, f), join(graveyard, `${f}.${stamp}`));
     }
-    console.warn(
-      `[db] 检测到崩溃残留锁文件（${present.join(', ')}），已移至 ${graveyard}，重试打开`,
-    );
-    return attempt();
+    // 这是正常路径（正常关闭也会留 pid 文件），不打 warn，
+    // 否则每次启动都有一条"崩溃"提示，真正的崩溃反而被淹没。
+    console.log(`[db] 清理上次遗留的锁文件（${present.join(', ')}）`);
+    try {
+      return await attempt();
+    } catch (err2) {
+      throw openFailureHint(err2, dataDir);
+    }
   }
+}
+
+/** 读 postmaster.pid 第一行的 pid；文件不存在或内容不是数字返回 null */
+function lockHolderPid(pidFile: string): number | null {
+  if (!existsSync(pidFile)) return null;
+  try {
+    const first = readFileSync(pidFile, 'utf8').split('\n')[0]?.trim() ?? '';
+    const pid = Number(first);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    // signal 0 不发送信号，只做存在性检查
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM 表示进程存在但无权操作 —— 依然算活着
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * 把 PGlite 的 `RuntimeError: Aborted()` 翻译成能照着做的提示。
+ *
+ * 原始错误只有一句 `Aborted(). Build with -sASSERTIONS for more info.`，
+ * 真正的死因（`PANIC: could not locate a valid checkpoint record`）埋在
+ * wasm 的 stderr 里，默认看不到。遇到这种情况继续排查方向是错的 ——
+ * 数据目录已经回不来了，唯一出路是重置，而人会先在错误信息里找半天。
+ */
+function openFailureHint(err: unknown, dataDir: string): Error {
+  const msg = String((err as Error)?.message ?? err);
+  const corrupt = /PANIC|checkpoint|Aborted|invalid|corrupt/i.test(msg);
+  if (!corrupt) return err instanceof Error ? err : new Error(msg);
+  return new Error(
+    [
+      `数据库无法打开：${dataDir}`,
+      '数据目录的 WAL 已损坏（通常是进程被强杀、写入未落盘导致），无法自动修复。',
+      '',
+      '处理办法：',
+      `  1. 备份现场：mv "${dataDir}" "${dataDir}.corrupt-$(date +%s)"`,
+      '  2. 重建：npm run db:reset   （会重新迁移并写入种子数据）',
+      '  3. 如果里面有要保留的数据，只能从备份目录人工捞，PGlite 没有离线修复工具。',
+      '',
+      `底层错误：${msg}`,
+    ].join('\n'),
+  );
 }
 
 export async function closeDb(): Promise<void> {

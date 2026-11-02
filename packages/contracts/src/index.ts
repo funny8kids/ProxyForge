@@ -433,6 +433,28 @@ export interface GatewayConfigRow {
 // 订阅
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * 订阅节点过滤条件。
+ *
+ * 过滤在服务端做，不是把 200 个节点全丢给客户端让它自己筛 ——
+ * 客户端筛掉的节点仍然会被 url-test 探测，等于没筛。
+ */
+export interface SubscriptionNodeFilter {
+  protocols?: ProxyProtocol[];
+  excludeProtocols?: ProxyProtocol[];
+  /** quality_score 下限，0–100 */
+  minQuality?: number;
+  /** p50 延迟上限（毫秒） */
+  maxLatencyMs?: number;
+  /** 主机名黑名单，子串匹配 */
+  excludeHosts?: string[];
+  /** 节点数上限，1–200 */
+  maxNodes?: number;
+}
+
+/** 分流模式：全局代理 / 规则分流 / 全部直连（排障） */
+export type SubscriptionRoutingMode = 'global' | 'rule' | 'direct';
+
 export interface SubscriptionRow {
   id: string;
   name: string;
@@ -448,6 +470,13 @@ export interface SubscriptionRow {
   lastAccessedAt: string | null;
   accessCount: number;
   createdAt: string;
+  /** 节点过滤条件 */
+  nodeFilter: SubscriptionNodeFilter;
+  /** 命名模板，占位符 {index} {protocol} {host} {port} {pool} */
+  nameTemplate: string | null;
+  routingMode: SubscriptionRoutingMode;
+  /** 追加分流规则，mihomo 行语法 */
+  extraRules: string[];
 }
 
 export interface SubscriptionCreated extends SubscriptionRow {

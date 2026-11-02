@@ -427,6 +427,44 @@ const ZH: Record<string, string> = {
     '公开列表会被抓取、解析，先落进候选隔离区。在你确认晋级之前，它们不会进入端点表。',
   'Public lists mix in honeypots and compromised hosts. Verifying before routing real traffic through them is not optional.':
     '公开列表里混着蜜罐和被入侵的主机。拿它们跑真实流量之前，先验证不是可选项。',
+  // 订阅：分流与过滤
+  Settings: '设置',
+  'Routing & filtering': '分流与过滤',
+  'Routing mode': '分流模式',
+  Global: '全局',
+  Rule: '规则',
+  Direct: '直连',
+  'All traffic through the proxy': '全部流量走代理',
+  'China direct, everything else proxied': '国内直连，其余走代理',
+  'Everything direct — use it to isolate whether the proxy is the problem':
+    '全部直连 —— 用来判断"是不是代理本身的问题"',
+  Protocols: '协议',
+  'None selected means all protocols': '不选等于全部协议',
+  'Only the selected protocols are published': '只发布选中的协议',
+  'Max latency': '延迟上限',
+  'Max nodes': '节点上限',
+  'Max latency drops nodes that have never been probed — "unknown" is not "fast".':
+    '设了延迟上限会排除从未探测成功过的节点 —— "不知道快不快"不等于"快"。',
+  'Exclude hosts': '排除主机',
+  'Substring match, comma separated': '子串匹配，逗号分隔',
+  'Name template': '命名模板',
+  'Placeholders: {index} {protocol} {host} {port} {pool}. Duplicates get a suffix.':
+    '占位符：{index} {protocol} {host} {port} {pool}；重名会自动加后缀。',
+  'Append rules': '追加规则',
+  'One rule per line, mihomo syntax. They run before the built-in rules. Any action other than DIRECT / REJECT means "go through this pool".':
+    '每行一条，mihomo 语法。它们排在内建规则之前；动作除 DIRECT / REJECT 外一律理解为"走本池"。',
+  Preview: '预览',
+  'By protocol': '协议分布',
+  'Sample names': '节点名示例',
+  'No node matches this filter. Loosen the conditions before saving.':
+    '没有节点满足这组条件，保存前请放宽条件。',
+  'The token stays the same, so clients do not need to be re-imported. Revision bumps automatically because the rendered content changed.':
+    'Token 不变，客户端不需要重新导入；因为渲染内容变了，revision 会自动递增。',
+  Save: '保存',
+  'Saving…': '保存中…',
+  Saved: '已保存',
+  Reset: '重置',
+
   // 订阅导出
   Export: '导出',
   'Export subscription': '导出订阅',

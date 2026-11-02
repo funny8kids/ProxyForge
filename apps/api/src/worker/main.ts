@@ -5,6 +5,7 @@ import { exec, q, q1 } from '../db/client.js';
 import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
+import { enqueueDueProbes, pruneSchedulerJobs, reclaimStaleJobs } from '../modules/verification/schedule.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
 import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
@@ -154,6 +155,10 @@ export async function relayOutbox(consumers: Consumer[] = CONSUMERS): Promise<vo
 }
 
 async function claimJobs(): Promise<void> {
+  // 回收过期租约：进程在探测途中被强杀，那个任务会永远停在 RUNNING，
+  // 既不会被重试也不会被清理。判断条件与调度器的"是否在跑"共用一处。
+  await reclaimStaleJobs();
+
   const jobs = await q<{ id: string; scope: string }>(
     `SELECT id, scope FROM verification_jobs
      WHERE status = 'PENDING' AND run_after <= now() AND attempts < max_attempts
@@ -164,14 +169,18 @@ async function claimJobs(): Promise<void> {
   for (const job of jobs) {
     const claimed = await exec(
       `UPDATE verification_jobs SET status = 'RUNNING', lease_owner = $2, attempts = attempts + 1,
-              started_at = COALESCE(started_at, now())
+              started_at = COALESCE(started_at, now()),
+              lease_expires_at = now() + interval '10 minutes'
        WHERE id = $1 AND status = 'PENDING'`,
       [job.id, `worker-${process.pid}`],
     );
     if (claimed === 0) continue;
     try {
+      const started = Date.now();
+      console.log(`[worker] 验证任务开始 ${job.id.slice(0, 8)}（${job.scope}）`);
       await runVerificationJob(job.id);
       stats.jobs += 1;
+      console.log(`[worker] 验证任务完成 ${job.id.slice(0, 8)}，用时 ${Date.now() - started}ms`);
     } catch (err) {
       stats.errors += 1;
       console.error('[worker] 验证任务失败', job.id, err);
@@ -264,24 +273,42 @@ let lastQualityRun = 0;
 
 async function periodic(): Promise<void> {
   if (!running.value) return;
+  // 分步计时：周期任务里任何一步卡住，界面上只会表现为"心跳不更新"，
+  // 分不清是池重算慢、网关下发卡住，还是告警评估在等锁。
+  const t0 = Date.now();
+  let phase = 'partitions';
   try {
     await maintainPartitions();
+    phase = 'enqueue';
+    // 分级探测：把到期的端点排成任务。必须在池重算**之前** ——
+    // 探测会改 lifecycle_status，而池成员是按它筛的；
+    // 顺序反了，这一轮的池成员用的是上一轮的健康态。
+    const enq = await enqueueDueProbes();
+    if (enq.picked > 0) {
+      // 真正执行在 claimJobs（500ms 一次），这里只是入队
+      console.log(`[worker] 探测入队 ${enq.picked} 个端点`);
+    }
     // 池成员随健康态变化漂移，定期重算保证策略编译看到的是新鲜集合
+    phase = 'pools';
     const pools = await q<{ id: string }>('SELECT id FROM resource_pools WHERE enabled = true');
     for (const p of pools) {
       await recomputePool(p.id);
     }
     // 成员变化后重新编译下发，并同步给运行时。
     // 只编译不下发会让"池成员已经换了"和"端口上转发用的还是旧成员"长期不一致。
+    phase = 'policies';
     const primaryId = await defaultInstanceId();
     await applyPolicies(primaryId, null);
+    phase = 'runtime';
     await applyRuntime(primaryId);
+    phase = 'heartbeat';
     const hb = await q1<{ c: string }>('SELECT count(*)::text AS c FROM gateway_instances');
     if (Number(hb?.c ?? 0) > 0) {
       await exec('UPDATE proxy_nodes SET last_heartbeat_at = now()');
     }
     // 来源质量：低分来源降权/停用。放在池重算之前 —— 停用会改变池成员，
     // 顺序反了会让这一轮的池成员基于还没降权的来源算出来。
+    phase = 'source-quality';
     if (Date.now() - lastQualityRun > QUALITY_INTERVAL_MS) {
       lastQualityRun = Date.now();
       const qr = await recomputeSourceQuality();
@@ -289,18 +316,25 @@ async function periodic(): Promise<void> {
       if (changed.length > 0) {
         for (const r of changed) console.log(`[worker] 来源 ${r.key}：${r.action} — ${r.detail}`);
       }
+      // 调度任务每 15 秒一条，一天就是 5760 行。不清理会让这张表
+      // 变成第二个只增不减的日志表，而它的价值只在最近几轮。
+      await pruneSchedulerJobs(7);
     }
 
     // 告警评估放在最后：它读的是上面几步刚写下的状态，
     // 先评估会拿上一轮的结果去判断，慢一个周期。
+    phase = 'alerts';
     const ev = await evaluateAlerts();
     if (ev.raised > 0 || ev.resolved > 0) {
       console.log(`[worker] 告警：${ev.raised} 条活跃 · ${ev.resolved} 条自动关闭`);
     }
     stats.alerts = ev.raised;
+    if (Date.now() - t0 > 5000) {
+      console.log(`[worker] 周期任务偏慢：${Date.now() - t0}ms`);
+    }
   } catch (err) {
-    noteError('periodic', err);
-    console.error('[worker] 周期任务失败', err);
+    noteError(phase, err);
+    console.error(`[worker] 周期任务失败（阶段 ${phase}）`, err);
   }
   setTimeout(periodic, config.schedulerIntervalMs);
 }

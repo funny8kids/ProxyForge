@@ -140,6 +140,13 @@ export const api = {
   overview: () => get<OverviewAnalytics>('/analytics/overview'),
 
   resources: (q: string) => get<Page<EndpointSummary>>(`/resources${q ? `?${q}` : ''}`),
+  /** 分级探测的到期情况。界面用它回答"为什么这个节点还没被探到"。 */
+  probeSchedule: () =>
+    get<{
+      tiers: Array<{ status: string; intervalMin: number | null; due: number; total: number }>;
+      activeJobs: number;
+      probeMode: string;
+    }>('/verification/schedule'),
   resource: (id: string) => get<EndpointDetail>(`/resources/${id}`),
   quarantine: (id: string) => post<{ ok: boolean }>(`/resources/${id}/quarantine`),
   /** 授权声明 / 改名 / 打标签。authorizationStatus 改成 REVOKED 会连带吊销生命周期。 */

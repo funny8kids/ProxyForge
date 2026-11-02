@@ -27,7 +27,12 @@ export type Scope =
   | 'ai:write'
   | 'audit:read'
   | 'alert:read'
-  | 'alert:write';
+  | 'alert:write'
+  /**
+   * 运维级操作（主动 CHECKPOINT、将来的保留策略执行）。
+   * 只给 ADMIN：这类操作没有业务语义，动的是存储本身。
+   */
+  | 'system:admin';
 
 export interface Actor {
   kind: 'USER' | 'API_KEY';
@@ -49,7 +54,7 @@ const ROLE_SCOPES: Record<UserRole, Scope[]> = {
     'verification:run', 'pool:read', 'pool:write', 'policy:read', 'policy:write',
     'gateway:read', 'gateway:apply', 'subscription:read', 'subscription:write',
     'trust:read', 'trust:write', 'trust:review', 'signing:manage',
-    'ai:read', 'ai:write', 'audit:read', 'alert:read', 'alert:write',
+    'ai:read', 'ai:write', 'audit:read', 'alert:read', 'alert:write', 'system:admin',
   ],
   OPERATOR: [
     'resource:read', 'resource:write', 'source:read', 'source:write',

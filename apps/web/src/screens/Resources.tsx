@@ -113,6 +113,8 @@ export function Resources(): JSX.Element {
 
       {error && <ErrorNote message={error} />}
 
+      <ProbeScheduleStrip />
+
       <Panel fill>
         <div className="table-wrap">
           {loading ? (
@@ -220,6 +222,58 @@ export function Resources(): JSX.Element {
           reload();
         }}
       />
+    </div>
+  );
+}
+
+/**
+ * 分级探测的进度条。
+ *
+ * 这一条存在的理由：`lifecycle_status` 在界面上是静止的，没人能看出
+ * "它从没被探过"和"探过、是好的"有什么区别。把每一档的周期和到期数摆出来，
+ * 才能回答"为什么这个节点还停在上次的状态"——是调度没开，还是排在后面没轮到。
+ *
+ * 只显示"到期 / 总数"而不是画进度环：这里的数字几乎总是 0，
+ * 一个恒为 0 的进度环只会让人以为坏了。
+ */
+function ProbeScheduleStrip(): JSX.Element | null {
+  const { t } = useI18n();
+  const { data } = useAsync(() => api.probeSchedule(), []);
+  if (!data) return null;
+
+  const rows = data.tiers.filter((x) => x.total > 0);
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="panel" style={{ padding: '10px 14px', marginBottom: 12 }}>
+      <div
+        style={{
+          display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap',
+          fontSize: 12, color: 'var(--muted)',
+        }}
+      >
+        <span style={{ color: 'var(--text)', fontWeight: 600 }}>{t('Probe schedule')}</span>
+        {rows.map((x) => (
+          <span key={x.status} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span>{t(lifecycleLabel[x.status] ?? x.status)}</span>
+            <span className="mono" style={{ color: 'var(--muted)' }}>
+              {x.intervalMin === null ? '—' : `${x.intervalMin}m`}
+            </span>
+            <span
+              className="mono"
+              style={{ color: x.due > 0 ? 'var(--warn)' : 'var(--ok)' }}
+            >
+              {x.due}/{x.total}
+            </span>
+          </span>
+        ))}
+        <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Badge tone={data.activeJobs > 0 ? 'info' : 'muted'}>
+            {data.activeJobs > 0 ? t('Probing') : t('Idle')}
+          </Badge>
+          <span className="mono" style={{ color: 'var(--muted)' }}>{data.probeMode}</span>
+        </span>
+      </div>
     </div>
   );
 }

@@ -358,8 +358,23 @@ export async function registerVerificationRoutes(app: FastifyInstance): Promise<
     return { id: jobId, scope: body.scope, status: 'PENDING' };
   });
 
-  app.get('/verification/jobs', { preHandler: guard('resource:read') }, async (): Promise<{ items: VerificationJobRow[] }> => {
-    const rows = await q<Record<string, unknown>>(
+  /**
+   * 分级探测的到期情况。
+   *
+   * 这个接口存在的理由：`lifecycle_status` 是静止的，用户看不出
+   * "它没被探过"和"探过但是好的"有什么区别。把每一档的到期数摆出来，
+   * 才能回答"为什么这个节点还停在上次的状态"。
+   */
+  app.get('/verification/schedule', { preHandler: guard('resource:read') }, async () => {
+    const { scheduleBacklog } = await import('./schedule.js');
+    const tiers = await scheduleBacklog();
+    const pending = await q1<{ c: string }>(
+      `SELECT count(*)::text AS c FROM verification_jobs WHERE status IN ('PENDING','RUNNING')`,
+    );
+    return { tiers, activeJobs: Number(pending?.c ?? 0), probeMode: PROBE_MODE };
+  });
+
+  app.get('/verification/jobs', { preHandler: guard('resource:read') }, async (): Promise<{ items: VerificationJobRow[] }> => {    const rows = await q<Record<string, unknown>>(
       `SELECT id, scope, status, total, completed, failed_count, created_at, started_at, finished_at
        FROM verification_jobs ORDER BY created_at DESC LIMIT 50`,
     );

@@ -30,7 +30,14 @@ import { exec, q } from '../../db/client.js';
 export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   // 新候选：快速失败淘汰。一个死节点留在候选区会一直占着池重算的算力
   DISCOVERED: 10,
-  PENDING_VERIFICATION: 10,
+  // 已经探过一次、还没出结论。
+  //
+  // 这里从 10 分钟放宽到 30 分钟，理由是 10 分钟只对**复探**有意义 ——
+  // 首次探测本来就是立刻排的（见 DUE_PREDICATE）。而一个已经失败过一次的
+  // 免费代理，十分钟后再试一次几乎不可能翻盘，却要占掉本可以给
+  // VERIFIED（关键路径）的预算。实测：120/轮的晋级速度下，10 分钟复探
+  // 让待验证队列涨到 3949 个，而其中九成是已经死掉的。
+  PENDING_VERIFICATION: 30,
   // 已经在坏，随时会掉 —— 这是最需要盯的一档
   DEGRADED: 30,
   // 过了第一次探测、还差一次连续成功才算 HEALTHY。

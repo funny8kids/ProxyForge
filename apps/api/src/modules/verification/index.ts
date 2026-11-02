@@ -317,15 +317,21 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
     // 攒到几千个死节点时，一半的探测容量都在给已经不存在的东西做体检。
     // REJECTED 在调度表里是 null 间隔，等于彻底退出探测。
     //
-    // 判死条件刻意收得很窄：**连续 3 次失败 + 从未成功过一次**。
+    // 判死条件刻意收得很窄：**连续 2 次失败 + 从未成功过一次**。
     // 也就是"从出生就是死的"那一类 —— 免费列表里占大多数。
+    //
     // 不用固定次数阈值：一个活过的节点（last_success_at 非空）掉线后
     // 仍可能回来，那种留在 UNAVAILABLE 按 120 分钟复核就够了。
+    //
+    // 为什么是 2 次而不是 3 次：第三次探测能提供的额外信息极少
+    // （同一个 4 秒超时，同一个不通的结果），代价却是让这个端点
+    // 在待验证队列里多待一整个复探周期，把预算从关键路径上挤走。
+    // 实测 120/轮的晋级速度下，3 次门槛让待验证队列涨到近 4000 个。
     //
     // 只对 PUBLIC_PROXY 生效：自有/私有资源的不可用可能是对方在维护，
     // 自动判死会让人在恢复后还得手工捞回来，那是帮倒忙。
     if (
-      !r.success && cf >= 3 && !prev?.last_success_at && cur?.trust_tier === 'PUBLIC_PROXY'
+      !r.success && cf >= 2 && !prev?.last_success_at && cur?.trust_tier === 'PUBLIC_PROXY'
     ) {
       next = 'REJECTED';
     }

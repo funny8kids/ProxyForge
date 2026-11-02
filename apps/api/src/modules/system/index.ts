@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { SystemStatus } from '@proxyforge/contracts';
 import { exec, ping, q1 } from '../../db/client.js';
+import { config } from '../../config.js';
 import { guard } from '../auth/index.js';
 import { PROBE_MODE } from '../verification/index.js';
 import { workerHealth } from '../../worker/main.js';
@@ -8,7 +9,7 @@ import { workerHealth } from '../../worker/main.js';
 const STARTED_AT = Date.now();
 
 export async function registerSystemRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/system/status', { preHandler: guard('resource:read') }, async (): Promise<SystemStatus & { probeMode: string }> => {
+  app.get('/system/status', { preHandler: guard('resource:read') }, async (): Promise<SystemStatus & { probeMode: string; databaseUrl: string }> => {
     const db = await ping();
 
     const gw = await q1<{ status: string; active_config_version: number | null }>(
@@ -45,6 +46,15 @@ export async function registerSystemRoutes(app: FastifyInstance): Promise<void> 
       // 进程边界自检：三平面在单进程内用模块边界模拟，Phase 2 拆为独立进程
       planes: { control: true, data: true, intelligence: true },
       probeMode: PROBE_MODE,
+      /**
+       * 进程实际打开的存储。
+       *
+       * 这个字段是排障用的，不是装饰：PGlite 的数据目录由相对路径解析而来，
+       * 一旦 cwd 或解析规则不一致，就会出现"迁移跑在 A、服务读的是 B"——
+       * 表现出来是界面全空、登录 401，而日志里没有任何错误。
+       * 排查这种问题唯一可靠的起点就是"你到底连的是哪个库"。
+       */
+      databaseUrl: config.databaseUrl,
     };
   });
 

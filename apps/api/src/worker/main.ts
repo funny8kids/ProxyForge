@@ -40,17 +40,33 @@ const stats = { outbox: 0, dead: 0, jobs: 0, discovery: 0, alerts: 0, errors: 0 
  */
 let lastError: { message: string; at: string } | null = null;
 
+/**
+ * 最后一轮周期任务**成功完成**的时间。
+ *
+ * 不能用 `proxy_nodes.last_heartbeat_at` 代表"worker 活着"：那张表可以合法地
+ * 是空的（本部署就没有 proxy_nodes 行），于是那个字段永远是 null ——
+ * 排查时会误判成"worker 从没跑过"，而实际上周期任务每一轮都在正常收尾。
+ * 这个字段直接回答"worker 上一轮什么时候跑完的"。
+ */
+let lastCycleAt: string | null = null;
+
 function noteError(scope: string, err: unknown): void {
   stats.errors += 1;
   const message = err instanceof Error ? `${scope}: ${err.message}` : `${scope}: ${String(err)}`;
   lastError = { message: message.slice(0, 300), at: new Date().toISOString() };
 }
 
-export function workerHealth(): { errors: number; lastError: string | null; lastErrorAt: string | null } {
+export function workerHealth(): {
+  errors: number;
+  lastError: string | null;
+  lastErrorAt: string | null;
+  lastCycleAt: string | null;
+} {
   return {
     errors: stats.errors,
     lastError: lastError?.message ?? null,
     lastErrorAt: lastError?.at ?? null,
+    lastCycleAt,
   };
 }
 
@@ -329,6 +345,7 @@ async function periodic(): Promise<void> {
       console.log(`[worker] 告警：${ev.raised} 条活跃 · ${ev.resolved} 条自动关闭`);
     }
     stats.alerts = ev.raised;
+    lastCycleAt = new Date().toISOString();
     if (Date.now() - t0 > 5000) {
       console.log(`[worker] 周期任务偏慢：${Date.now() - t0}ms`);
     }

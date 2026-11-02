@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 
@@ -24,15 +24,50 @@ export async function getDb(): Promise<PGlite> {
     // 这个坑很贵 —— 现场是"数据库莫名其妙损坏"，而根因只是"忘了先停服务"。
     const holder = dataDirHolder(config.databaseUrl);
     if (holder !== null) throw heldByProcessError(holder, config.databaseUrl);
+    acquireInstanceLock(config.databaseUrl);
     instance = await openWithStaleLockRecovery(config.databaseUrl);
   }
   await instance.waitReady;
   return instance;
 }
 
+/**
+ * 进程级独占锁。
+ *
+ * 为什么不能只依赖 `postmaster.pid`：那个文件会被 `openWithStaleLockRecovery`
+ * 搬到 `.data/stale-locks/`。于是出现过这样的序列 ——
+ *   A 启动 → 把上一位留下的 pid 文件搬走 → 正常持有数据库
+ *   B 启动 → 目录里已经没有 pid 文件了 → 认为"没人占用" → 也打开了同一个目录
+ * 两个 PGlite 各自按自己的 WAL 恢复，一个看到 122 个端点，另一个看到 0 个。
+ * 表现出来是"数据忽有忽无"，而两边都不报错。
+ *
+ * 所以需要一个**我们自己控制、且不会被恢复逻辑搬走**的锁。
+ * 用 `wx` 独占创建，内容是 pid；启动时若发现 pid 还活着就拒绝。
+ */
+const LOCK_FILE = 'proxyforge.lock';
+
+function acquireInstanceLock(dataDir: string): void {
+  const lockPath = join(dataDir, LOCK_FILE);
+  const holder = lockHolderPid(lockPath);
+  if (holder !== null && isAlive(holder)) throw heldByProcessError(holder, dataDir);
+
+  // 陈旧锁（pid 已死）直接覆盖。writeFileSync 用 'w' 是覆盖语义，
+  // 这里不需要 wx —— 前面已经确认过没有活着的持有者。
+  writeFileSync(lockPath, `${process.pid}\n`);
+  process.once('exit', () => {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* 退出阶段删不掉（比如 safe-delete shim 拦截）不该影响退出 */
+    }
+  });
+}
+
 /** 数据目录是否被一个**活着的**进程占用；是则返回那个 pid */
 export function dataDirHolder(dataDir: string): number | null {
   if (dataDir === 'memory://') return null;
+  const own = lockHolderPid(join(dataDir, LOCK_FILE));
+  if (own !== null && isAlive(own)) return own;
   const pid = lockHolderPid(join(dataDir, 'postmaster.pid'));
   if (pid === null) return null;
   return isAlive(pid) ? pid : null;
@@ -42,7 +77,7 @@ function heldByProcessError(pid: number, dataDir: string): Error {
   return new Error(
     [
       `数据库被另一个进程占用：${dataDir}`,
-      `postmaster.pid 指向 pid ${pid}，该进程仍在运行。`,
+      `锁文件指向 pid ${pid}，该进程仍在运行。`,
       '',
       'PGlite 是嵌入式单写者：两个进程同时打开同一数据目录会把 WAL 写坏，',
       '而且损坏之后无法修复（只能 db:reset）。所以这里直接拒绝，不冒险重试。',
@@ -177,6 +212,16 @@ export async function closeDb(): Promise<void> {
   if (instance) {
     await instance.close();
     instance = null;
+  }
+  // 主动释放独占锁：正常情况下 exit 钩子也会做，
+  // 但 migrate/seed/reset 这类脚本是 closeDb 之后立刻 exit，
+  // 留一个死 pid 的锁文件会让下一次启动多一次"陈旧锁"判断。
+  if (config.databaseUrl !== 'memory://') {
+    try {
+      unlinkSync(join(config.databaseUrl, LOCK_FILE));
+    } catch {
+      /* 没有锁文件或删不掉都不影响正确性 */
+    }
   }
 }
 

@@ -655,6 +655,14 @@ export interface SystemStatus {
     errors?: number;
     lastError?: string | null;
     lastErrorAt?: string | null;
+    /**
+     * 最后一轮周期任务成功完成的时间。
+     *
+     * 与 `lastHeartbeatAt` 分开：后者是**节点**心跳（proxy_nodes 可以合法为空，
+     * 那它就永远是 null），前者是**worker** 自己的进度。把两者混成一个字段，
+     * 会让人把"没有节点"误读成"worker 没在跑"。
+     */
+    lastCycleAt?: string | null;
   };
   /** 三层平面的进程边界自检结果 */
   planes: { control: boolean; data: boolean; intelligence: boolean };

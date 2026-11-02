@@ -179,6 +179,56 @@ export async function probe(target: ProbeTarget, timeoutMs = DEFAULT_TIMEOUT): P
  */
 const CONNECT_DST = { host: 'www.gstatic.com', port: 443 } as const;
 
+/**
+ * 在已建立的隧道上做一次 TLS 握手。
+ *
+ * 这是"隧道真的能通"的唯一可信证据。只检查 `CONNECT` 的响应码不够 ——
+ * 实测有一大批 SOCKS 节点会**批准连接（回 0x5A）然后把数据丢掉**，
+ * 于是 `connect_ok` 报 true，而 curl 连过去是 000。
+ *
+ * 具体撞到的情形：订阅里位置 100–200 的节点全部 `connect_ok=true`，
+ * 按段抽样却是 0/10 可用；把那些节点捞出来一看，清一色是 SOCKS4/SOCKS5。
+ * 而位置 0–100 的 HTTP 代理同样标 true，实测 40% 可用 —— 差别就在这里：
+ * HTTP 代理的 `200 Connection established` 至少意味着它愿意转发，
+ * SOCKS 的 `0x5A` 只意味着"我知道这个请求格式"。
+ *
+ * 做完整 TLS 握手能同时覆盖两种情况：隧道两端必须真的能收发字节。
+ *
+ * **必须校验证书**（`rejectUnauthorized` 保持默认 true）。用 false 的话，
+ * 一批拦截型代理会在本地终止 TLS、拿自签证书把握手"完成"掉，于是这里报
+ * true，而真实流量到目标站点根本不通 —— 实测就是这个把位置 50–165 的节点
+ * 全标成了 connect_ok=true，按段抽查却 0/16 可用。
+ *
+ * 要求证书链对 `www.gstatic.com` 有效，语义正好等价于用户想问的那句话：
+ * "我能不能通过它正常打开一个 HTTPS 网站"。
+ */
+function tlsOverTunnel(socket: Socket, host: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let tlsSocket: ReturnType<typeof tlsConnect> | null = null;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        tlsSocket?.destroy();
+      } catch {
+        /* 已经坏了就算了 */
+      }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      tlsSocket = tlsConnect({ socket, servername: host });
+    } catch {
+      finish(false);
+      return;
+    }
+    tlsSocket.once('secureConnect', () => finish(true));
+    tlsSocket.once('error', () => finish(false));
+  });
+}
+
 async function probeConnect(target: ProbeTarget, timeoutMs: number): Promise<boolean> {
   let address: string;
   try {
@@ -198,26 +248,30 @@ async function probeConnect(target: ProbeTarget, timeoutMs: number): Promise<boo
   }
 
   try {
+    let tunnelUp: boolean;
     if (target.protocol === 'SOCKS5') {
       // null = 握手与 CONNECT 都成功
-      return (await socks5Handshake(socket, target, timeoutMs, CONNECT_DST)) === null;
-    }
-    if (target.protocol === 'SOCKS4') {
-      return (await socks4Handshake(socket, target, timeoutMs, CONNECT_DST)).ok;
+      tunnelUp = (await socks5Handshake(socket, target, timeoutMs, CONNECT_DST)) === null;
+    } else if (target.protocol === 'SOCKS4') {
+      tunnelUp = (await socks4Handshake(socket, target, timeoutMs, CONNECT_DST)).ok;
+    } else {
+      const lines = [
+        `CONNECT ${CONNECT_DST.host}:${CONNECT_DST.port} HTTP/1.1`,
+        `Host: ${CONNECT_DST.host}:${CONNECT_DST.port}`,
+        'User-Agent: ProxyForge-Probe/1.0',
+      ];
+      if (target.username) {
+        const token = Buffer.from(`${target.username}:${target.password ?? ''}`, 'utf8').toString('base64');
+        lines.push(`Proxy-Authorization: Basic ${token}`);
+      }
+      socket.write([...lines, '', ''].join('\r\n'));
+      const raw = await readUntil(socket, timeoutMs, (s) => s.includes('\r\n\r\n'));
+      tunnelUp = /^HTTP\/1\.[01]\s+200/.test(raw);
     }
 
-    const lines = [
-      `CONNECT ${CONNECT_DST.host}:${CONNECT_DST.port} HTTP/1.1`,
-      `Host: ${CONNECT_DST.host}:${CONNECT_DST.port}`,
-      'User-Agent: ProxyForge-Probe/1.0',
-    ];
-    if (target.username) {
-      const token = Buffer.from(`${target.username}:${target.password ?? ''}`, 'utf8').toString('base64');
-      lines.push(`Proxy-Authorization: Basic ${token}`);
-    }
-    socket.write([...lines, '', ''].join('\r\n'));
-    const raw = await readUntil(socket, timeoutMs, (s) => s.includes('\r\n\r\n'));
-    return /^HTTP\/1\.[01]\s+200/.test(raw);
+    if (!tunnelUp) return false;
+    // 批准了还不够 —— 数据必须真的能流动。
+    return await tlsOverTunnel(socket, CONNECT_DST.host, timeoutMs);
   } catch {
     return false;
   } finally {

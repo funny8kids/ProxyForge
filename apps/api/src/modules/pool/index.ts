@@ -63,13 +63,17 @@ const POOL_SELECT = `
 /**
  * 重算池成员。
  *
- * 三道闸门按顺序收紧，任何一道都不能绕过：
+ * 四道闸门按顺序收紧，任何一道都不能绕过：
  *   1. 规则谓词（结构化 DSL，字段白名单）
  *   2. allowed_tiers（分级准入）—— PUBLIC_PROXY 默认进不来
- *   3. min_quality / max_members（容量与质量底线）
+ *   3. 生命周期（只有 HEALTHY / DEGRADED 算成员）
+ *   4. min_quality / max_members（容量与质量底线）
  *
  * 第 2 道是关键：即使规则里写了 trustTier in (PUBLIC_PROXY)，
  * 只要池的 allowed_tiers 不含 PUBLIC_PROXY，成员依然进不来。
+ *
+ * 第 3 道保证 member_count 与"能下发多少"是同一个数。
+ * 少了它，池子看起来是满的、订阅却是空的，而两个数字都"没错"。
  */
 export async function recomputePool(poolId: string, actorId?: string): Promise<{ added: number; removed: number }> {
   return tx(async (t) => {
@@ -100,11 +104,15 @@ export async function recomputePool(poolId: string, actorId?: string): Promise<{
          LEFT JOIN ip_assets i ON i.id = e.ip_asset_id
          WHERE e.deleted_at IS NULL
            AND e.trust_tier::text = ANY($1::text[])
+           -- 只有活着的端点算池成员，与订阅视图同口径。
+           -- 不加这条时，池的 member_count 会包含大量已判定不可用的端点：
+           -- 界面上写着"实验池 120 个成员"，实际能下发的只有几个，
+           -- 而 max_members 的 120 个名额也会被死节点占着。
+           AND e.lifecycle_status IN ('HEALTHY', 'DEGRADED')
            AND s.quality_score >= ${Number(pool.min_quality)}
            AND ${compiled.sql}`,
         [toTextArray(pool.allowed_tiers), ...compiled.params],
-      );
-      for (const r of rows) {
+      );      for (const r of rows) {
         if (!selected.has(r.id)) selected.set(r.id, 100);
       }
     }

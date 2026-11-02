@@ -69,6 +69,10 @@ async function mkSource(opts: {
  * 给来源挂 n 个节点。
  * `alive` 指 HEALTHY/DEGRADED 的数量，其余记为 UNAVAILABLE —— 这两个状态
  * 的划分直接决定存活率，是评分里权重最高的一项。
+ *
+ * 必须同时写 endpoint_health_state.last_check_at：评分只统计**探测过**的端点。
+ * 没探过的端点不算样本，否则一个刚导入的源会在第一轮探测跑完之前
+ * 就被判"存活 0%"，那不是质量信号，是还没开始。
  */
 async function mkNodes(
   sourceId: string,
@@ -86,6 +90,11 @@ async function mkNodes(
       ],
     );
     await exec(`INSERT INTO endpoint_sources (endpoint_id, source_id) VALUES ($1,$2)`, [id, sourceId]);
+    await exec(
+      `INSERT INTO endpoint_health_state (endpoint_id, last_check_at, quality_score)
+       VALUES ($1, now(), $2) ON CONFLICT DO NOTHING`,
+      [id, opts.quality],
+    );
   }
 }
 
@@ -135,12 +144,28 @@ console.log('\n[2] 健康来源');
 const good = await mkSource({ key: 'good' });
 await mkNodes(good, { n: 8, alive: 8, quality: 90 });
 
-await check('8 个全 HEALTHY、质量 90 → 94.5 分，action none', async () => {
+await check('8 个全 HEALTHY、质量 90 → 94.5 分，信任级从 40 恢复到 45', async () => {
   const r = pick(await recomputeSourceQuality(), 'good');
-  assert.equal(r.action, 'none');
+  // 信任级是双向的：低于 55 扣 5，高于 75 还 5。
+  // 没有"还"这一半的话，一次误判（或我们自己的取样口径出错）
+  // 会变成永久惩罚 —— 而 trust_level 表达的应该是"最近的表现"。
+  assert.equal(r.action, 'trust-restored');
   // 0.55 * 90 + 0.45 * 100
   assert.equal(r.score, 94.5);
-  assert.equal((await sourceRow(good)).quality_score, '94.50');
+  const row = await sourceRow(good);
+  assert.equal(row.quality_score, '94.50');
+  assert.equal(row.trust_level, 45);
+});
+
+await check('信任级恢复到中性值（50）就停，不继续往上加分', async () => {
+  // 一次恢复 5 点：40 → 45（上一条）→ 50（这条）
+  assert.equal(pick(await recomputeSourceQuality(), 'good').action, 'trust-restored');
+  assert.equal((await sourceRow(good)).trust_level, 50, '50 是建库默认值');
+
+  // 到 50 之后不再动它 —— 超过中性值等于替人做背书
+  const r = pick(await recomputeSourceQuality(), 'good');
+  assert.equal(r.action, 'none');
+  assert.equal((await sourceRow(good)).trust_level, 50);
 });
 
 console.log('\n[3] 低分降权');

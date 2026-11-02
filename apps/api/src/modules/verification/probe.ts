@@ -509,17 +509,53 @@ const errText = (err: unknown): string =>
  * 出网很慢"的节点排到前面去。
  */
 export function qualityScore(input: {
-  successRate: number;
+  successes: number;
+  total: number;
   p50Ms: number | null;
   jitterMs: number | null;
 }): number {
-  const ratePart = input.successRate * 70; // 70 分权重
+  const ratePart = smoothedSuccessRate(input.successes, input.total) * 70; // 70 分权重
   // 从未成功过的节点 p50 是 null，按最差档算 —— 不能当成"0ms 很快"
   const latency = input.p50Ms ?? 3000;
   const latencyPart = Math.max(0, Math.min(20, ((3000 - latency) / 2700) * 20));
   const jitter = input.jitterMs ?? 500;
   const jitterPart = Math.max(0, Math.min(10, ((400 - jitter) / 400) * 10));
   return Math.round((ratePart + latencyPart + jitterPart) * 100) / 100;
+}
+
+/**
+ * 成功率平滑（加性先验）：`(succ + k·p0) / (total + k)`。
+ *
+ * ## 为什么不能用裸成功率
+ *
+ * 直接用 `succ / total` 时，**一次探测成功就是 100%**，能拿 70 分满分，
+ * 压过所有打过多轮的老节点。而 HEALTHY 的复探周期是 360 分钟，
+ * 一个节点一天最多也就攒到四五次样本 —— 所以"新节点样本少"不是边角情况，
+ * 是常态。
+ *
+ * 实测后果：把采集目标从 400 提到 1500 之后，池子里换进来一批刚探测一次
+ * 的新节点，它们的分数 79–87，把原本稳定的老节点挤出前 300。导出订阅后
+ * 独立抽查 12 个，**只有 1 个能连上 HTTPS**（此前同一口径是 9/12）。
+ * 排序被小样本污染，订阅质量就会断崖式下跌。
+ *
+ * ## 为什么是加性先验而不是 Wilson 下界
+ *
+ * Wilson 下界对 n=1 的惩罚极重（1/1 只有 20.7%），而 HEALTHY 节点普遍
+ * 只有 1–4 个样本，全都会被压到 `minQuality` 门槛以下，池子会直接空掉。
+ * 加性先验（k=3，p0=0.5，等价于"先验三次观测、对半分"）既能拉开
+ * 1/1 与 4/4 的差距，又不会把分数整体压塌：
+ *
+ *     1/1  → 0.625    4/4  → 0.786    2/4  → 0.500
+ *
+ * 来源信任级用的是 Wilson 下界而不是这个 —— 那边的样本量是成百上千
+ * （一个源动辄几千条候选），大样本下 Wilson 才是对的工具。
+ */
+const PRIOR_K = 3;
+const PRIOR_P = 0.5;
+
+export function smoothedSuccessRate(successes: number, total: number): number {
+  if (total <= 0) return PRIOR_P;
+  return (successes + PRIOR_K * PRIOR_P) / (total + PRIOR_K);
 }
 
 export { tlsConnect };

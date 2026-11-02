@@ -6,6 +6,7 @@ import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
 import { backfillExitGeography } from '../modules/verification/geo.js';
+import { rescoreQuality } from '../modules/verification/rescore.js';
 import { ACTIVE_JOB_PREDICATE, enqueueDueProbes, pruneFinishedJobs, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
@@ -467,6 +468,16 @@ export function startWorker(): () => void {
       if (n > 0) console.log(`[worker] 出口地理回填 ${n} 个端点`);
     })
     .catch((err) => noteError('backfill-geo', err));
+
+  // 质量分重算：`quality_score` 是写时计算的，改了打分公式之后存量值仍是
+  // 旧公式的结果。靠自然复探刷一遍要一整天，这期间池子仍按被污染的旧分数
+  // 选人 —— 实测就是"池子里混进一批只探过一次的新节点，订阅里 12 个只有
+  // 1 个能连 HTTPS"。启动时全量重算一次，之后回到写时计算。
+  void rescoreQuality()
+    .then((n) => {
+      if (n > 0) console.log(`[worker] 质量分重算 ${n} 个端点`);
+    })
+    .catch((err) => noteError('rescore', err));
 
   void periodic();
   void tick();

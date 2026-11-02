@@ -244,6 +244,39 @@ await check('探测进行中同时执行 CHECKPOINT / 池重算 → 不死锁', 
   assert.equal(j?.completed, 20);
 });
 
+console.log('\n[质量分不能奖励小样本]');
+
+const { qualityScore, smoothedSuccessRate } = await import('../apps/api/src/modules/verification/probe.js');
+
+await check('一次成功不该拿满分成功率', async () => {
+  // 裸成功率下 1/1 就是 1.0，能拿 70 分满分，压过所有打过多轮的老节点。
+  // 实测后果：池子里换进一批刚探一次的新节点，导出订阅后抽查 12 个
+  // 只有 1 个能连 HTTPS（此前 9/12）。
+  const one = smoothedSuccessRate(1, 1);
+  const four = smoothedSuccessRate(4, 4);
+  assert.ok(one < 0.7, `1/1 的平滑成功率 ${one} 不该接近满分`);
+  assert.ok(four > one, '4/4 必须比 1/1 更可信');
+  assert.ok(four - one > 0.1, `差距 ${four - one} 太小，排不开序`);
+});
+
+await check('质量分排序：多轮全胜 > 单次全胜 > 半数成功', async () => {
+  const fast = { p50Ms: 600, jitterMs: 50 };
+  const q1 = qualityScore({ successes: 4, total: 4, ...fast });
+  const q2 = qualityScore({ successes: 1, total: 1, ...fast });
+  const q3 = qualityScore({ successes: 2, total: 4, ...fast });
+  assert.ok(q1 > q2, `4/4 (${q1}) 应高于 1/1 (${q2})`);
+  assert.ok(q2 > q3, `1/1 (${q2}) 应高于 2/4 (${q3})`);
+});
+
+await check('零样本按先验半分，不按 0 分', async () => {
+  // total=0 时不能返回 0：那会让"刚建出来还没探过"和"探了全失败"同分，
+  // 而前者恰恰是最该给它一次机会的。
+  assert.equal(smoothedSuccessRate(0, 0), 0.5);
+  const none = qualityScore({ successes: 0, total: 0, p50Ms: null, jitterMs: null });
+  const allFail = qualityScore({ successes: 0, total: 5, p50Ms: null, jitterMs: null });
+  assert.ok(none > allFail, `没探过 (${none}) 不该低于全失败 (${allFail})`);
+});
+
 await closeDb();
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);
 process.exit(fail === 0 ? 0 : 1);

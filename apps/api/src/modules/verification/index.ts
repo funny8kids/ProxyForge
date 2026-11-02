@@ -262,10 +262,12 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
       [endpointId],
     );
 
-    const totalChecks = Number(allCount?.c ?? 1);
-    const successRate = totalChecks > 0 ? Number(agg?.succ ?? 0) / totalChecks : 0;
+    const totalChecks = Number(allCount?.c ?? 0);
+    const successes = Number(agg?.succ ?? 0);
+    const successRate = totalChecks > 0 ? successes / totalChecks : 0;
     const score = qualityScore({
-      successRate,
+      successes,
+      total: totalChecks,
       p50Ms: agg?.p50 ? Number(agg.p50) : null,
       jitterMs: agg?.jitter ? Number(agg.jitter) : null,
     });

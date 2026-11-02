@@ -19,6 +19,7 @@ interface Member {
   port: number;
   protocol: string;
   quality_score: string;
+  lifecycle_status: string;
   connect_ok: boolean | null;
 }
 
@@ -139,7 +140,7 @@ const BANDS = [
 console.log(`\n池 ${POOL}`);
 console.log(`成员 ${total} 个（另有 ${dropped} 个建不起隧道、订阅已剔除），拿到健康状态 ${health.size} 个\n`);
 
-const header = ['区间'.padEnd(12), ...ORDER.map((b) => b.padStart(9)), '  新鲜率'].join(' ');
+const header = ['区间'.padEnd(12), ...ORDER.map((b) => b.padStart(9)), '  成功新鲜', '  探测新鲜'].join(' ');
 console.log(header);
 console.log('-'.repeat(header.length + 6));
 
@@ -147,6 +148,7 @@ for (const band of BANDS) {
   const slice = members.slice(band.from, band.to);
   const counts = new Map<string, number>();
   let fresh = 0;
+  let checked = 0;
   let scored = 0;
   for (const m of slice) {
     const h = health.get(m.endpoint_id);
@@ -156,11 +158,14 @@ for (const band of BANDS) {
       scored += 1;
       const age = ageMinutes(h.last_success_at);
       if (age !== null && age <= 30) fresh += 1;
+      const cAge = ageMinutes(h.last_check_at);
+      if (cAge !== null && cAge <= 30) checked += 1;
     }
   }
   const cells = ORDER.map((b) => String(counts.get(b) ?? 0).padStart(9));
   const rate = scored ? `${((fresh / scored) * 100).toFixed(0)}%` : '-';
-  console.log([band.label.padEnd(12), ...cells, `  ${rate.padStart(6)}`].join(' '));
+  const cRate = scored ? `${((checked / scored) * 100).toFixed(0)}%` : '-';
+  console.log([band.label.padEnd(12), ...cells, `  ${rate.padStart(7)}`, `  ${cRate.padStart(7)}`].join(' '));
 }
 
 const firstStale = members.findIndex((m) => {
@@ -177,3 +182,20 @@ console.log(`30 分钟内成功过的节点：${alive.length} / ${total}`);
 console.log(`其中 connect_ok=true：${alive.filter((m) => m.connect_ok === true).length} 个`);
 console.log(`connect_ok=false：${members.filter((m) => m.connect_ok === false).length} 个`);
 console.log(`connect_ok=null：${members.filter((m) => m.connect_ok === null).length} 个\n`);
+
+// 生命周期分布 —— 用来区分「调度没探它」和「探了但失败」。
+// 如果大部分是 UNAVAILABLE，说明它们早被判死，只是还挂在池成员表里。
+const byStatus = new Map<string, number>();
+for (const m of members) byStatus.set(m.lifecycle_status, (byStatus.get(m.lifecycle_status) ?? 0) + 1);
+console.log('生命周期分布：');
+for (const [status, n] of [...byStatus.entries()].sort((a, b) => b[1] - a[1])) {
+  console.log(`  ${status.padEnd(20)} ${String(n).padStart(5)}`);
+}
+
+// 池成员表与订阅视图的口径差：订阅视图只收 HEALTHY/DEGRADED，
+// 池成员表若含其它状态，说明池重算没把它们摘掉。
+const notEligible = members.filter((m) => !['HEALTHY', 'DEGRADED'].includes(m.lifecycle_status));
+if (notEligible.length > 0) {
+  console.log(`\n注意：${notEligible.length} 个池成员不在订阅视图的收录范围内（非 HEALTHY/DEGRADED）`);
+}
+console.log();

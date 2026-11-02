@@ -649,3 +649,49 @@ export interface SystemStatus {
   /** 三层平面的进程边界自检结果 */
   planes: { control: boolean; data: boolean; intelligence: boolean };
 }
+
+// ─────────────────────────────────────────────────────────────
+// 告警与事件
+// ─────────────────────────────────────────────────────────────
+
+export type AlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+export interface AlertRow {
+  id: string;
+  /** 去重键：同一 key 未解决时只累加 count */
+  key: string;
+  severity: AlertSeverity;
+  /** ACKED 表示人看到了但问题仍在 —— 不从列表里消失 */
+  status: 'OPEN' | 'ACKED' | 'RESOLVED';
+  title: string;
+  detail: string | null;
+  subjectType: string | null;
+  subjectId: string | null;
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  resolvedAt: string | null;
+  autoResolved: boolean;
+}
+
+export interface EventMetricPoint {
+  day: string;
+  eventType: string;
+  count: number;
+}
+
+export interface EventPipelineStats {
+  byStatus: Record<'PENDING' | 'PUBLISHED' | 'DEAD', number>;
+  items: Array<{
+    id: string;
+    eventId: string;
+    eventType: string;
+    aggregateType: string;
+    aggregateId: string;
+    payload: unknown;
+    attempts: number;
+    lastError: string | null;
+    deadAt: string | null;
+    consumerState: Record<string, { ok: boolean; at: string; error?: string }> | null;
+  }>;
+}

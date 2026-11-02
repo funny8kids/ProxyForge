@@ -25,7 +25,9 @@ export type Scope =
   | 'signing:manage'
   | 'ai:read'
   | 'ai:write'
-  | 'audit:read';
+  | 'audit:read'
+  | 'alert:read'
+  | 'alert:write';
 
 export interface Actor {
   kind: 'USER' | 'API_KEY';
@@ -47,17 +49,17 @@ const ROLE_SCOPES: Record<UserRole, Scope[]> = {
     'verification:run', 'pool:read', 'pool:write', 'policy:read', 'policy:write',
     'gateway:read', 'gateway:apply', 'subscription:read', 'subscription:write',
     'trust:read', 'trust:write', 'trust:review', 'signing:manage',
-    'ai:read', 'ai:write', 'audit:read',
+    'ai:read', 'ai:write', 'audit:read', 'alert:read', 'alert:write',
   ],
   OPERATOR: [
     'resource:read', 'resource:write', 'source:read', 'source:write',
     'verification:run', 'pool:read', 'pool:write', 'policy:read', 'policy:write',
     'gateway:read', 'subscription:read', 'subscription:write',
-    'trust:read', 'trust:write', 'trust:review', 'ai:read', 'audit:read',
+    'trust:read', 'trust:write', 'trust:review', 'ai:read', 'audit:read', 'alert:read', 'alert:write',
   ],
   VIEWER: [
     'resource:read', 'source:read', 'pool:read', 'policy:read',
-    'gateway:read', 'subscription:read', 'trust:read', 'ai:read', 'audit:read',
+    'gateway:read', 'subscription:read', 'trust:read', 'ai:read', 'audit:read', 'alert:read',
   ],
 };
 

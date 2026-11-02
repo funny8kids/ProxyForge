@@ -7,6 +7,8 @@ import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
+import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
+import { evaluateAlerts } from '../modules/events/evaluate.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -25,7 +27,7 @@ import { applyRuntime } from '../modules/gateway/runtime.js';
  */
 
 const running = { value: true };
-const stats = { outbox: 0, jobs: 0, discovery: 0, errors: 0 };
+const stats = { outbox: 0, dead: 0, jobs: 0, discovery: 0, alerts: 0, errors: 0 };
 /**
  * 最后一次失败的摘要。
  *
@@ -50,28 +52,102 @@ export function workerHealth(): { errors: number; lastError: string | null; last
   };
 }
 
-async function relayOutbox(): Promise<void> {
+/** 事件重试上限。超过就进死信，等人工重放而不是无限重试。 */
+const MAX_OUTBOX_ATTEMPTS = 5;
+
+/**
+ * Outbox 中继。
+ *
+ * 三个必须做对的地方：
+ *
+ * 1. **按消费方记状态**。`consumer_state` 存每个消费方的成败，
+ *    重试时跳过已成功的那些。否则指标聚合成功、告警评估失败时，
+ *    整条事件重试会让指标重复累加 —— 数字悄悄偏大，没人会发现。
+ *
+ * 2. **指数退避**。失败后立刻重试只会连着撞同一堵墙（比如上游 5xx
+ *    持续 30 秒）。退避 2/4/8/16 秒，把重试摊开。
+ *
+ * 3. **死信必须可见**。超过上限标成 DEAD，而不是留在
+ *    `published_at IS NULL AND attempts >= 5` 这种"既不在队列里、
+ *    也不在结果里"的状态。死信会触发告警，并能从接口重放。
+ */
+export async function relayOutbox(consumers: Consumer[] = CONSUMERS): Promise<void> {
   // PGlite 单连接，SKIP LOCKED 语义退化为普通加锁；生产 PG 下才真正并行
-  const events = await q<{ id: string; event_id: string; event_type: string; aggregate_type: string; aggregate_id: string; payload: unknown }>(
-    `SELECT id, event_id, event_type, aggregate_type, aggregate_id, payload
+  const events = await q<{
+    id: string; event_id: string; event_type: string; aggregate_type: string;
+    aggregate_id: string; payload: unknown; occurred_at: string; attempts: number;
+    consumer_state: Record<string, { ok: boolean; at: string; error?: string }> | null;
+  }>(
+    `SELECT id, event_id, event_type, aggregate_type, aggregate_id, payload,
+            occurred_at, attempts, consumer_state
      FROM event_outbox
-     WHERE published_at IS NULL AND attempts < 5
+     WHERE status = 'PENDING' AND next_attempt_at <= now()
      ORDER BY id
      LIMIT 100`,
   );
 
   for (const evt of events) {
+    const state: Record<string, { ok: boolean; at: string; error?: string }> = { ...(evt.consumer_state ?? {}) };
+    const failed: string[] = [];
+
+    const event = {
+      id: evt.id,
+      eventId: evt.event_id,
+      eventType: evt.event_type,
+      aggregateType: evt.aggregate_type,
+      aggregateId: evt.aggregate_id,
+      payload: (evt.payload ?? {}) as Record<string, unknown>,
+      occurredAt: String(evt.occurred_at),
+      attempts: evt.attempts,
+    };
+
+    for (const consumer of consumers) {
+      // 已成功的消费方不再执行 —— 这是"重试不重复计数"的唯一保证
+      if (state[consumer.name]?.ok) continue;
+      try {
+        await consumer.handle(event);
+        state[consumer.name] = { ok: true, at: new Date().toISOString() };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        state[consumer.name] = { ok: false, at: new Date().toISOString(), error: message.slice(0, 300) };
+        failed.push(`${consumer.name}: ${message}`);
+      }
+    }
+
+    const attempts = evt.attempts + 1;
     try {
-      // 事件消费者在这里挂载。当前阶段只做"已发布"标记，
-      // 消费方（缓存失效、通知、指标）在 Phase 2 接入。
-      await exec('UPDATE event_outbox SET published_at = now(), attempts = attempts + 1 WHERE id = $1', [evt.id]);
-      stats.outbox += 1;
+      if (failed.length === 0) {
+        await exec(
+          `UPDATE event_outbox
+           SET status = 'PUBLISHED', published_at = now(), attempts = $2,
+               consumer_state = $3::jsonb, last_error = NULL
+           WHERE id = $1`,
+          [evt.id, attempts, JSON.stringify(state)],
+        );
+        stats.outbox += 1;
+      } else if (attempts >= MAX_OUTBOX_ATTEMPTS) {
+        await exec(
+          `UPDATE event_outbox
+           SET status = 'DEAD', dead_at = now(), attempts = $2,
+               consumer_state = $3::jsonb, last_error = $4
+           WHERE id = $1`,
+          [evt.id, attempts, JSON.stringify(state), failed.join(' | ').slice(0, 1000)],
+        );
+        stats.dead += 1;
+        console.warn(`[worker] 事件进入死信 ${evt.event_id}（${evt.event_type}）：${failed.join(' | ')}`);
+      } else {
+        // 2^attempts 秒：2, 4, 8, 16
+        const delaySec = Math.min(60, 2 ** attempts);
+        await exec(
+          `UPDATE event_outbox
+           SET attempts = $2, consumer_state = $3::jsonb, last_error = $4,
+               next_attempt_at = now() + ($5 || ' seconds')::interval
+           WHERE id = $1`,
+          [evt.id, attempts, JSON.stringify(state), failed.join(' | ').slice(0, 1000), String(delaySec)],
+        );
+      }
     } catch (err) {
-      stats.errors += 1;
-      await exec(
-        'UPDATE event_outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1',
-        [evt.id, err instanceof Error ? err.message : String(err)],
-      );
+      noteError('outbox-write', err);
     }
   }
 }
@@ -111,6 +187,21 @@ async function maintainPartitions(): Promise<void> {
   await exec('SELECT ensure_monthly_partitions(2)');
   await exec(`SELECT drop_expired_partitions('health_checks', 3)`);
   await exec(`SELECT drop_expired_partitions('gateway_traffic_samples', 6)`);
+
+  /**
+   * 定期检查点。
+   *
+   * 不是性能优化，是**抗崩溃**：PGlite 把 WAL 写缓冲在 wasm 侧，
+   * 进程被强杀（`taskkill /F`、容器 OOM）时最后一段 WAL 会丢，
+   * 而 pg_control 已经指向它 —— 下次启动就是
+   * `PANIC: could not locate a valid checkpoint record`，整个数据目录报废。
+   * 这个错误在本地已经出现过四次，每次都得 db:reset。
+   *
+   * CHECKPOINT 会强制刷盘并写下一条可恢复的检查点记录，把"丢失窗口"
+   * 从"上次检查点到现在"压到调度周期（默认 15 秒）。
+   * 代价是一次全量刷脏页；对本地这种写入量完全无所谓。
+   */
+  await exec('CHECKPOINT');
 }
 
 /**
@@ -178,6 +269,13 @@ async function periodic(): Promise<void> {
     if (Number(hb?.c ?? 0) > 0) {
       await exec('UPDATE proxy_nodes SET last_heartbeat_at = now()');
     }
+    // 告警评估放在最后：它读的是上面几步刚写下的状态，
+    // 先评估会拿上一轮的结果去判断，慢一个周期。
+    const ev = await evaluateAlerts();
+    if (ev.raised > 0 || ev.resolved > 0) {
+      console.log(`[worker] 告警：${ev.raised} 条活跃 · ${ev.resolved} 条自动关闭`);
+    }
+    stats.alerts = ev.raised;
   } catch (err) {
     noteError('periodic', err);
     console.error('[worker] 周期任务失败', err);

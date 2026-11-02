@@ -20,6 +20,9 @@ import type {
   SubscriptionCreated,
   SubscriptionNodeFilter,
   SubscriptionRoutingMode,
+  AlertRow,
+  EventMetricPoint,
+  EventPipelineStats,
   SystemStatus,
   TrustSummary,
   VerificationJobRow,
@@ -279,6 +282,22 @@ export const api = {
    */
   exportSubscription: (id: string, format: string) =>
     downloadFile(`/subscriptions/${id}/export?format=${encodeURIComponent(format)}`),
+
+  /** 默认只返回未解决（含已确认）的告警 */
+  alerts: (status = 'open') =>
+    get<{ items: AlertRow[]; bySeverity: Record<string, number> }>(`/alerts?status=${status}`),
+  ackAlert: (id: string) => post<{ ok: boolean }>(`/alerts/${id}/ack`),
+  resolveAlert: (id: string) => post<{ ok: boolean }>(`/alerts/${id}/resolve`),
+  /** 手动触发一次评估：刚修好的东西不该等下一轮才变绿 */
+  evaluateAlerts: () => post<{ ok: boolean; raised: number; resolved: number }>('/alerts/evaluate'),
+
+  eventMetrics: (days = 14) =>
+    get<{ days: number; items: EventMetricPoint[]; byType: Array<{ eventType: string; count: number }> }>(
+      `/events/metrics?days=${days}`,
+    ),
+  deadLetters: () => get<EventPipelineStats>('/events/dead'),
+  replayDeadLetter: (id: string) =>
+    post<{ ok: boolean; skippedConsumers: string[] }>(`/events/dead/${id}/replay`),
 
   aiProviders: () => get<{ items: AiProviderRow[] }>('/ai/providers'),
   aiBindings: () => get<{ items: AiTaskBindingRow[] }>('/ai/task-bindings'),

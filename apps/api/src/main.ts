@@ -19,6 +19,7 @@ import { registerAnalyticsRoutes } from './modules/analytics/index.js';
 import { registerAuditRoutes } from './modules/audit/index.js';
 import { registerAiRoutes } from './modules/ai/index.js';
 import { registerSystemRoutes } from './modules/system/index.js';
+import { registerEventRoutes } from './modules/events/index.js';
 
 export async function buildApp(): Promise<ReturnType<typeof Fastify>> {
   const app = Fastify({
@@ -141,6 +142,7 @@ export async function buildApp(): Promise<ReturnType<typeof Fastify>> {
       await registerAuditRoutes(scope);
       await registerAiRoutes(scope);
       await registerSystemRoutes(scope);
+      await registerEventRoutes(scope);
     },
     { prefix: '/api/v1' },
   );

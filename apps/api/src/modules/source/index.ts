@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { CandidateRow, ProxyProtocol, SourceSummary, TrustTier } from '@proxyforge/contracts';
-import { q, q1, tx } from '../../db/client.js';
+import { exec, q, q1, tx } from '../../db/client.js';
 import { actorOf, guard } from '../auth/index.js';
 import { audit, emit, EVENT_TYPES } from '../../shared/events.js';
 import { invalid, notFound } from '../../shared/errors.js';
@@ -644,10 +644,28 @@ async function syncSource(
 ): Promise<SyncOutcome> {
   const t0 = Date.now();
   const base = { sourceId: source.id, key: source.key, name: source.name };
-  const fail = (error: string): SyncOutcome => ({
-    ...base, ok: false, snapshotId: null, entries: 0, candidates: 0,
-    duplicateSnapshot: false, format: '-', warnings: [], error, durationMs: Date.now() - t0,
-  });
+  /**
+   * 失败时必须落库。
+   *
+   * 之前这里只是 return 一个 ok:false 的响应，库里什么都没留下 ——
+   * 一个 URL 已经 404 的来源，界面上永远显示"从未同步"，和"刚建好还没跑过"
+   * 完全一样；而"它每 6 小时失败一次"这件事只存在于当时那个 HTTP 响应里。
+   * 落库之后，来源列表能显示失败原因，告警评估器也能据此提出告警。
+   */
+  const fail = async (error: string): Promise<SyncOutcome> => {
+    await exec(
+      `UPDATE resource_sources
+       SET last_attempt_at = now(), last_sync_status = 'FAILED', last_sync_error = $2
+       WHERE id = $1`,
+      [source.id, error.slice(0, 500)],
+    ).catch(() => {
+      /* 记状态失败不该掩盖真正的同步错误 */
+    });
+    return {
+      ...base, ok: false, snapshotId: null, entries: 0, candidates: 0,
+      duplicateSnapshot: false, format: '-', warnings: [], error, durationMs: Date.now() - t0,
+    };
+  };
 
   let content = opts.content ?? '';
   let httpStatus: number | null = null;
@@ -663,12 +681,12 @@ async function syncSource(
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       content = await res.text();
     } catch (err) {
-      return fail(`拉取失败: ${err instanceof Error ? err.message : String(err)}`);
+      return await fail(`拉取失败: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   if (!content) {
-    return fail('没有内容：MANUAL 来源需要在请求体里提供 content');
+    return await fail('没有内容：MANUAL 来源需要在请求体里提供 content');
   }
 
   const hint = ((source.config?.['protocolHint'] as ProxyProtocol | undefined) ?? 'HTTP');
@@ -714,7 +732,11 @@ async function syncSource(
     if (existing) {
       duplicateSnapshot = true;
       // 内容没变也要刷新 last_synced_at，否则界面会一直显示"从未同步"
-      await t.exec('UPDATE resource_sources SET last_synced_at = now() WHERE id = $1', [source.id]);
+      await t.exec(
+        `UPDATE resource_sources SET last_synced_at = now(), last_attempt_at = now(),
+                last_sync_status = 'OK', last_sync_error = NULL WHERE id = $1`,
+        [source.id],
+      );
       return;
     }
 
@@ -748,7 +770,8 @@ async function syncSource(
 
     await t.exec('UPDATE source_snapshots SET candidate_count = $2 WHERE id = $1', [snapshotId, inserted]);
     await t.exec(
-      'UPDATE resource_sources SET last_synced_at = now(), last_snapshot_id = $2 WHERE id = $1',
+      `UPDATE resource_sources SET last_synced_at = now(), last_attempt_at = now(),
+              last_sync_status = 'OK', last_sync_error = NULL, last_snapshot_id = $2 WHERE id = $1`,
       [source.id, snapshotId],
     );
     await audit(t, {

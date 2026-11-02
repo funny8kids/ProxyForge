@@ -1159,6 +1159,15 @@
      这种长度，355px 的抽屉里塞四个会全部挤成两行。改成纵向堆叠。 */
   .dl-row{display:grid;gap:7px}
   .dl-row .btn{justify-content:flex-start}
+  /* 告警 / 死信行：左侧是内容（可换行），右侧是操作按钮（不压缩）。
+     用 align-items:flex-start 而不是 center —— 描述文字换行成三行时，
+     按钮居中会浮在中间，看起来像另一行的一部分。 */
+  .alert-row{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:10px;
+    padding:9px 11px;border-radius:8px;
+    background:var(--ov-1);box-shadow:inset 0 0 0 1px var(--line);
+  }
+
   .fmt-row{
     display:flex;align-items:center;justify-content:space-between;gap:12px;
     padding:10px 12px;border-radius:8px;

@@ -465,6 +465,24 @@ const ZH: Record<string, string> = {
   Saved: '已保存',
   Reset: '重置',
 
+  // 告警与事件管道
+  Alerts: '告警',
+  'All clear — nothing is currently failing.': '一切正常 —— 当前没有失败项。',
+  'Condition-based; clears itself when the cause goes away': '基于条件；原因消失后会自动关闭',
+  '{n} open': '{n} 条未解决',
+  Ack: '确认',
+  acked: '已确认',
+  Resolve: '标记解决',
+  'Mark resolved manually': '手动标记为已解决',
+  'Re-evaluate now': '立即重新评估',
+  'Event pipeline': '事件管道',
+  'Outbox → consumers → metrics / alerts': 'Outbox → 消费方 → 指标 / 告警',
+  Published: '已发布',
+  'Dead letters': '死信',
+  Replay: '重放',
+  'Re-run only the consumers that failed': '只重跑失败的消费方，已成功的不重复执行',
+  'No events consumed yet.': '还没有事件被消费。',
+
   // 订阅导出
   Export: '导出',
   'Export subscription': '导出订阅',

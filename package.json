@@ -26,7 +26,8 @@
     "test:render": "node node_modules/tsx/dist/cli.mjs scripts/subscription-render.test.mts",
     "db:check": "npm run -w @proxyforge/api db:check",
     "db:query": "node node_modules/tsx/dist/cli.mjs scripts/db-query.mts",
-    "test:events": "DATABASE_URL=memory:// node node_modules/tsx/dist/cli.mjs scripts/events-pipeline.test.mts"
+    "test:events": "node node_modules/tsx/dist/cli.mjs scripts/events-pipeline.test.mts",
+    "test:quality": "node node_modules/tsx/dist/cli.mjs scripts/source-quality.test.mts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

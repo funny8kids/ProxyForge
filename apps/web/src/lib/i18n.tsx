@@ -465,6 +465,11 @@ const ZH: Record<string, string> = {
   Saved: '已保存',
   Reset: '重置',
 
+  // 来源质量
+  FAILED: '失败',
+  'auto-disabled': '已被系统自动停用',
+  'Not enough imported endpoints to score yet': '已导入的端点太少，还不足以评分',
+
   // 告警与事件管道
   Alerts: '告警',
   'All clear — nothing is currently failing.': '一切正常 —— 当前没有失败项。',

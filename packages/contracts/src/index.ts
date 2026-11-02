@@ -262,6 +262,16 @@ export interface SourceSummary {
   totalCandidates: number;
   /** 已晋级为端点的数量 */
   promotedCandidates: number;
+  /** 上次同步结果；FAILED 会触发告警 */
+  lastSyncStatus: 'NEVER' | 'OK' | 'FAILED';
+  lastSyncError: string | null;
+  /** 0–100；null 表示样本不足还没算过 */
+  qualityScore: number | null;
+  /** 参与评分的端点数。分数必须和它一起看 */
+  qualitySampleSize: number;
+  /** 被系统自动停用的时间（AUTHORIZED 来源不会走到这里） */
+  autoDisabledAt: string | null;
+  autoDisableReason: string | null;
 }
 
 export interface SourceSyncOutcome {

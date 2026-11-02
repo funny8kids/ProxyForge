@@ -57,6 +57,8 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
     const rows = await q<Record<string, unknown>>(
       `SELECT s.id, s.key, s.name, s.type, s.url, s.format_hint, s.authorization_status,
               s.trust_level, s.enabled, s.sync_interval_seconds, s.last_synced_at, s.notes, s.config,
+              s.last_sync_status, s.last_sync_error, s.quality_score, s.quality_sample_size,
+              s.auto_disabled_at, s.auto_disable_reason,
               COALESCE(c.pending, 0)  AS pending,
               COALESCE(c.total, 0)    AS total,
               COALESCE(c.promoted, 0) AS promoted
@@ -90,8 +92,32 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
           pendingCandidates: Number(r.pending ?? 0),
           totalCandidates: Number(r.total ?? 0),
           promotedCandidates: Number(r.promoted ?? 0),
+          lastSyncStatus: (r.last_sync_status as SourceSummary['lastSyncStatus']) ?? 'NEVER',
+          lastSyncError: (r.last_sync_error as string) ?? null,
+          // numeric 列在 PGlite 里是字符串；null 要保留成 null 而不是 0 ——
+          // "没算过"和"算出来是 0 分"是两件事
+          qualityScore: r.quality_score === null ? null : Number(r.quality_score),
+          qualitySampleSize: Number(r.quality_sample_size ?? 0),
+          autoDisabledAt: r.auto_disabled_at ? String(r.auto_disabled_at) : null,
+          autoDisableReason: (r.auto_disable_reason as string) ?? null,
         };
       }),
+    };
+  });
+
+  /**
+   * 手动重算来源质量。
+   *
+   * worker 每 5 分钟自动跑一次；这里是为了"刚导入完想立刻看结果"。
+   * 返回逐条动作而不是只返回计数 —— 自动降权会改变系统行为，
+   * 触发者需要知道到底动了谁。
+   */
+  app.post('/sources/recompute-quality', { preHandler: guard('source:write') }, async () => {
+    const { recomputeSourceQuality } = await import('./quality.js');
+    const items = await recomputeSourceQuality();
+    return {
+      items,
+      changed: items.filter((i) => i.action !== 'none' && i.action !== 'skipped').length,
     };
   });
 

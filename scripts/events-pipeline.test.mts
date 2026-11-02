@@ -13,13 +13,21 @@
  * 跑法：npm run test:events
  */
 import assert from 'node:assert/strict';
-import { closeDb, exec, getDb, q, q1, tx } from '../apps/api/src/db/client.js';
-import { migrate } from '../apps/api/src/db/migrate.js';
-import { emit, EVENT_TYPES } from '../apps/api/src/shared/events.js';
-import { raiseAlert, resolveStale, listAlerts } from '../apps/api/src/modules/events/alerts.js';
-import { evaluateAlerts } from '../apps/api/src/modules/events/evaluate.js';
-import { CONSUMERS, type Consumer } from '../apps/api/src/modules/events/consumers.js';
-import { relayOutbox } from '../apps/api/src/worker/main.js';
+
+// 必须在 import 数据库客户端**之前**落到 env 上：config 在模块加载时求值，
+// 而 ESM 的 import 会被提升。之前靠 npm script 里的 `DATABASE_URL=... cmd`
+// 前缀，那个写法在 Windows 的 cmd.exe 下不成立 —— 也就是说这个测试曾经会
+// 直接打开 .data/pg。测试永远不该碰真实数据目录，所以默认值放在文件里。
+process.env.DATABASE_URL ??= 'memory://';
+
+const { closeDb, exec, getDb, q, q1, tx } = await import('../apps/api/src/db/client.js');
+const { migrate } = await import('../apps/api/src/db/migrate.js');
+const { emit, EVENT_TYPES } = await import('../apps/api/src/shared/events.js');
+const { raiseAlert, resolveStale, listAlerts } = await import('../apps/api/src/modules/events/alerts.js');
+const { evaluateAlerts } = await import('../apps/api/src/modules/events/evaluate.js');
+const { CONSUMERS } = await import('../apps/api/src/modules/events/consumers.js');
+type Consumer = import('../apps/api/src/modules/events/consumers.js').Consumer;
+const { relayOutbox } = await import('../apps/api/src/worker/main.js');
 
 let pass = 0;
 let fail = 0;

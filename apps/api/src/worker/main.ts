@@ -9,6 +9,7 @@ import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
 import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
 import { evaluateAlerts } from '../modules/events/evaluate.js';
+import { recomputeSourceQuality } from '../modules/source/quality.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -251,6 +252,16 @@ async function tick(): Promise<void> {
   setTimeout(tick, config.outboxIntervalMs);
 }
 
+/**
+ * 来源质量重算的节流。
+ *
+ * 质量分是按"已导入端点的存活率"算的，而端点健康态由验证任务更新 ——
+ * 那是以分钟为单位的节奏。每 15 秒重算一次只是把同样的数字算 20 遍，
+ * 还会让 quality_computed_at 失去意义（看不出上一次真正的变化）。
+ */
+const QUALITY_INTERVAL_MS = 5 * 60 * 1000;
+let lastQualityRun = 0;
+
 async function periodic(): Promise<void> {
   if (!running.value) return;
   try {
@@ -269,6 +280,17 @@ async function periodic(): Promise<void> {
     if (Number(hb?.c ?? 0) > 0) {
       await exec('UPDATE proxy_nodes SET last_heartbeat_at = now()');
     }
+    // 来源质量：低分来源降权/停用。放在池重算之前 —— 停用会改变池成员，
+    // 顺序反了会让这一轮的池成员基于还没降权的来源算出来。
+    if (Date.now() - lastQualityRun > QUALITY_INTERVAL_MS) {
+      lastQualityRun = Date.now();
+      const qr = await recomputeSourceQuality();
+      const changed = qr.filter((r) => r.action !== 'none' && r.action !== 'skipped');
+      if (changed.length > 0) {
+        for (const r of changed) console.log(`[worker] 来源 ${r.key}：${r.action} — ${r.detail}`);
+      }
+    }
+
     // 告警评估放在最后：它读的是上面几步刚写下的状态，
     // 先评估会拿上一轮的结果去判断，慢一个周期。
     const ev = await evaluateAlerts();

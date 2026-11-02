@@ -214,6 +214,12 @@ export async function seed(): Promise<void> {
     const key = dedupeKey({
       protocol: e.protocol, host: e.host, port: e.port, username: null, password: null,
     });
+    // 主来源。必须同时写进 endpoint_sources：那张表是 provenance 的**唯一**真相，
+    // proxy_endpoints.source_id 只是"首次发现它的来源"这一个冗余字段。
+    // 只写 source_id 不写 endpoint_sources 的后果是真实的：来源质量评分按
+    // endpoint_sources 聚合，缺了它每个来源的样本数都是 0，评分永远停在"样本不足"，
+    // 自动降权这条链路在种子环境里等于没接上。
+    const primarySource = e.tier === 'PRIVATE_PROXY' ? sourceFeed : sourceGithub;
 
     await exec(
       `INSERT INTO ip_assets (id, ip, ip_version, ip_type, ip_type_confidence, network_type,
@@ -234,7 +240,7 @@ export async function seed(): Promise<void> {
           expected_country, dedupe_key, tags, last_verified_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::text[], now() - ($17 || ' minutes')::interval)`,
       [
-        e.id, ipId, e.tier === 'PRIVATE_PROXY' ? sourceFeed : sourceGithub,
+        e.id, ipId, primarySource,
         e.protocol, e.host, e.port, e.origin,
         e.lifecycle === 'PENDING_VERIFICATION' ? 'UNKNOWN' : 'AUTHORIZED',
         e.tier, e.grant, e.lifecycle, e.quality,
@@ -259,6 +265,15 @@ export async function seed(): Promise<void> {
         e.p50, e.p95, e.jitter,
         Math.round(e.successRate * 10000) / 10000, e.quality,
       ],
+    );
+
+    // 部分节点在公开列表里出现过多次：last_seen_at 比 first_seen_at 晚，
+    // 这样来源页的"最近一次贡献"才有真实分布，而不是全部等于 now()。
+    const seenTimes = between(1, 600);
+    await exec(
+      `INSERT INTO endpoint_sources (endpoint_id, source_id, first_seen_at, last_seen_at)
+       VALUES ($1, $2, now() - interval '30 days', now() - ($3 || ' minutes')::interval)`,
+      [e.id, primarySource, seenTimes],
     );
   }
   console.log(`  ✓ ${endpoints.length} 个端点`);

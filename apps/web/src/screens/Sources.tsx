@@ -7,6 +7,13 @@ import { useAsync } from '../lib/useAsync';
 import { useI18n } from '../lib/i18n';
 import { compact, relativeTime } from '../lib/format';
 
+/** 质量分颜色：低于 40 是"该停用它了"，55 以下需要关注 */
+function qualityColor(score: number): string {
+  if (score < 40) return 'var(--bad)';
+  if (score < 55) return 'var(--warn)';
+  return 'var(--text)';
+}
+
 /**
  * 来源采集。
  *
@@ -223,6 +230,7 @@ export function Sources(): JSX.Element {
                   <th>{t('Format')}</th>
                   <th>{t('Type')}</th>
                   <th style={{ textAlign: 'right' }}>{t('Trust')}</th>
+                  <th style={{ textAlign: 'right' }}>{t('Quality')}</th>
                   <th>{t('Last sync')}</th>
                   <th style={{ textAlign: 'right' }}>{t('Candidates')}</th>
                   <th />
@@ -239,6 +247,17 @@ export function Sources(): JSX.Element {
                           {s.type === 'MANUAL' && <Badge tone="muted">{t('manual')}</Badge>}
                         </div>
                         {s.notes && <div className="row-sub">{s.notes}</div>}
+                        {/*
+                          自动停用必须显式写在名字下面。只把 enabled 改成 false 的话，
+                          这个源在列表里只是"变灰了"，和手动停用的源长得一模一样，
+                          而人根本不知道自己没关过它。
+                        */}
+                        {s.autoDisabledAt && (
+                          <div className="row-sub" style={{ color: 'var(--bad)' }} title={s.autoDisableReason ?? undefined}>
+                            {t('auto-disabled')}
+                            {s.autoDisableReason ? ` · ${s.autoDisableReason}` : ''}
+                          </div>
+                        )}
                       </td>
                       <td>
                         {s.protocolHint ? (
@@ -254,8 +273,37 @@ export function Sources(): JSX.Element {
                       <td className="num" style={{ textAlign: 'right' }}>
                         {s.trustLevel}
                       </td>
+                      <td className="num" style={{ textAlign: 'right' }}>
+                        {s.qualityScore === null ? (
+                          <span
+                            style={{ color: 'var(--text-4)' }}
+                            title={t('Not enough imported endpoints to score yet')}
+                          >
+                            —
+                          </span>
+                        ) : (
+                          <span
+                            title={`${s.qualitySampleSize} ${t('endpoints')}`}
+                            style={{ color: qualityColor(s.qualityScore) }}
+                          >
+                            {s.qualityScore.toFixed(0)}
+                          </span>
+                        )}
+                      </td>
                       <td style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
-                        {s.lastSyncedAt ? relativeTime(s.lastSyncedAt, lang) : t('never')}
+                        {/*
+                          同步失败要看得见。之前失败什么都不写，界面上一直显示
+                          "从未同步"，和"刚建好还没跑过"完全分不出来。
+                        */}
+                        {s.lastSyncStatus === 'FAILED' ? (
+                          <span title={s.lastSyncError ?? undefined}>
+                            <Badge tone="bad">{t('FAILED')}</Badge>
+                          </span>
+                        ) : s.lastSyncedAt ? (
+                          relativeTime(s.lastSyncedAt, lang)
+                        ) : (
+                          t('never')
+                        )}
                       </td>
                       <td className="num" style={{ textAlign: 'right' }}>
                         <span style={{ color: s.pendingCandidates > 0 ? 'var(--text)' : 'var(--text-4)' }}>

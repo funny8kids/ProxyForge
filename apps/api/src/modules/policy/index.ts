@@ -26,6 +26,37 @@ export interface ApplyResult {
   changed: boolean;
 }
 
+/**
+ * 把编译结果转成引擎消费的结构化规格。
+ *
+ * 只保留"要连谁、怎么连"—— 不含凭据、不含质量分、不含授权状态。
+ * 那些是编译期的判断依据，运行期只需要结果。
+ */
+function buildRuntimeSpec(instanceName: string, compiled: CompileOutput[]): {
+  instanceName: string;
+  policies: Array<{
+    policyKey: string; listenPort: number; strategy: string;
+    members: Array<{ endpointId: string; host: string; port: number; protocol: string }>;
+  }>;
+} {
+  return {
+    instanceName,
+    policies: compiled
+      .filter((c) => c.policy.members.length > 0)
+      .map((c) => ({
+        policyKey: c.policy.policyKey,
+        listenPort: c.policy.listenPort,
+        strategy: c.policy.strategy,
+        members: c.policy.members.map((m) => ({
+          endpointId: m.endpointId,
+          host: m.host,
+          port: m.port,
+          protocol: m.protocol,
+        })),
+      })),
+  };
+}
+
 export async function applyPolicies(instanceId: string, actorId: string | null): Promise<ApplyResult> {
   const instance = await q1<{ id: string; name: string }>(
     'SELECT id, name FROM gateway_instances WHERE id = $1',
@@ -111,6 +142,15 @@ export async function applyPolicies(instanceId: string, actorId: string | null):
     [instanceId],
   );
   if (active && active.config_hash === hash) {
+    // 内容没变不产生新版本，但 runtime_spec 仍要刷新：
+    // 它可能在旧版本里是空的（比如升级前编译的），而运行时靠它启动。
+    // 不刷新就会出现"编译成功、hash 一致、但引擎拿到空规格起不来"。
+    const runtimeSpec = buildRuntimeSpec(instance.name, compiled);
+    await exec(
+      `UPDATE gateway_configs SET runtime_spec = $3::jsonb
+       WHERE instance_id = $1 AND version = $2`,
+      [instanceId, Number(active.version), JSON.stringify(runtimeSpec)],
+    );
     return {
       instanceId,
       version: Number(active.version),
@@ -136,18 +176,26 @@ export async function applyPolicies(instanceId: string, actorId: string | null):
     );
 
     const configId = uuidv7();
+    // 引擎消费的结构化规格。刻意**不含凭据** —— 这份 JSON 会和 YAML 一起
+    // 进版本历史，把 credential_ref 写进来等于让"谁引用了哪个密钥"
+    // 变成可查询的历史记录。运行时按 endpointId 单独查凭据。
+    const runtimeSpec = buildRuntimeSpec(instance.name, compiled);
+
     await t.exec(
       `INSERT INTO gateway_configs
-         (id, instance_id, version, status, config_hash, rendered_config, policy_ids, warnings, applied_at, created_by)
-       VALUES ($1,$2,$3,'APPLIED',$4,$5,$6::uuid[],$7::jsonb, now(), $8)`,
+         (id, instance_id, version, status, config_hash, rendered_config, runtime_spec, policy_ids, warnings, applied_at, created_by)
+       VALUES ($1,$2,$3,'APPLIED',$4,$5,$6::jsonb,$7::uuid[],$8::jsonb, now(), $9)`,
       [
-        configId, instanceId, next, hash, rendered,
+        configId, instanceId, next, hash, rendered, JSON.stringify(runtimeSpec),
         policies.map((p) => p.id), JSON.stringify(allWarnings), actorId,
       ],
     );
 
+    // 只更新"配置指向哪一版"。status 由 runtime supervisor 独占写入 ——
+    // 编译成功不代表进程在跑，两件事混用一个字段就会互相覆盖，
+    // 表现是界面上一会儿显示 APPLIED 一会儿显示 RUNNING。
     await t.exec(
-      `UPDATE gateway_instances SET active_config_version = $2, status = 'APPLIED', last_seen_at = now()
+      `UPDATE gateway_instances SET active_config_version = $2, last_seen_at = now()
        WHERE id = $1`,
       [instanceId, next],
     );

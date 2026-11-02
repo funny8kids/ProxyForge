@@ -21,7 +21,8 @@
     "dev": "node scripts/dev.mjs",
     "build": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api build && npm run -w @proxyforge/web build",
     "typecheck": "npm run -w @proxyforge/contracts build && npm run -w @proxyforge/api typecheck && npm run -w @proxyforge/web typecheck",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "test:engine": "node node_modules/tsx/dist/cli.mjs scripts/gateway-engine.test.mts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

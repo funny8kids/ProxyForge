@@ -166,6 +166,14 @@ if (isMain) {
   await app.listen({ port: config.port, host: config.host });
   console.log(`ProxyForge API → http://${config.host}:${config.port}/api/v1`);
 
+  // 把网关实例真正拉起来。不做这一步，编译好的配置就只是库里的一行 YAML，
+  // 端口上没有任何东西在监听。
+  const { startAllRuntimes, stopAllRuntimes } = await import('./modules/gateway/runtime.js');
+  for (const r of await startAllRuntimes()) {
+    const mark = r.state === 'RUNNING' ? '✓' : '·';
+    console.log(`  ${mark} 网关 ${r.name}：${r.state} — ${r.detail}`);
+  }
+
   // PGlite 是嵌入式单写者，第二个进程打开同一 data 目录会直接崩在 initdb。
   // 因此本地默认把 worker 循环挂在本进程内；换真 PG 后设 PF_WORKER_MODE=process
   // 即可恢复独立进程形态，代码路径不变。
@@ -175,7 +183,7 @@ if (isMain) {
     for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.on(sig, () => {
         stop();
-        process.exit(0);
+        void stopAllRuntimes().finally(() => process.exit(0));
       });
     }
   }

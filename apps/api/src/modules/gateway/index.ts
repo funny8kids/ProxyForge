@@ -5,6 +5,7 @@ import { actorOf, guard } from '../auth/index.js';
 import { audit } from '../../shared/events.js';
 import { notFound } from '../../shared/errors.js';
 import { applyPolicies, defaultInstanceId } from '../policy/index.js';
+import { applyRuntime, runtimeSnapshot, stopRuntime } from './runtime.js';
 
 export async function registerGatewayRoutes(app: FastifyInstance): Promise<void> {
   app.get('/gateway/instances', { preHandler: guard('gateway:read') }, async (): Promise<{ items: GatewayInstanceRow[] }> => {
@@ -20,6 +21,14 @@ export async function registerGatewayRoutes(app: FastifyInstance): Promise<void>
         socksPort: Number(r.socks_port),
         activeConfigVersion: (r.active_config_version as number) ?? null,
         lastSeenAt: (r.last_seen_at as string) ?? null,
+        // 运行时状态与编译状态分开返回：前者是"端口在不在听"，
+        // 后者是"配置编到第几版"。合并成一个字段会让两者互相覆盖。
+        engineKind: (r.engine_kind as string) ?? 'builtin',
+        runtimeState: (r.runtime_state as string) ?? 'STOPPED',
+        runtimeError: (r.runtime_error as string) ?? null,
+        runtimeStartedAt: (r.runtime_started_at as string) ?? null,
+        runtimeReloadAt: (r.runtime_reload_at as string) ?? null,
+        listeners: (r.listeners as unknown[]) ?? [],
       })),
     };
   });
@@ -80,7 +89,10 @@ export async function registerGatewayRoutes(app: FastifyInstance): Promise<void>
     const applied = [];
     for (const inst of instances) {
       const res = await applyPolicies(inst.id, actor.id);
-      applied.push({ ...res, name: inst.name });
+      // 编译完立刻下发给引擎 —— 只编译不下发是之前那个"配置看起来生效了
+      // 但端口没人听"的根源。这里失败不回滚编译结果，但把错误带回去。
+      const runtime = await applyRuntime(inst.id);
+      applied.push({ ...res, name: inst.name, runtime });
     }
 
     const primaryId = await defaultInstanceId();
@@ -98,7 +110,74 @@ export async function registerGatewayRoutes(app: FastifyInstance): Promise<void>
         memberCount: a.memberCount,
         policyCount: a.policyCount,
         warnings: a.warnings,
+        runtimeState: a.runtime.state,
+        runtimeError: a.runtime.error,
+        listeners: a.runtime.listeners,
       })),
+    };
+  });
+
+  /**
+   * 启动 / 停止 / 热更新单个实例的运行时。
+   *
+   * 和 /gateway/reload 的区别：reload 会重新编译配置（可能产生新版本），
+   * 这三个只动进程，不动配置版本。排障时更需要后者 —— 改配置是"改了什么"，
+   * 重启是"让它重新听"。
+   */
+  app.post('/gateway/instances/:id/start', { preHandler: guard('gateway:apply') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const actor = actorOf(req);
+    const exists = await q1<{ id: string }>('SELECT id FROM gateway_instances WHERE id = $1', [id]);
+    if (!exists) throw notFound('网关实例');
+
+    const res = await applyRuntime(id);
+    await tx(async (t) => {
+      await audit(t, {
+        actorType: actor.kind, actorId: actor.id, action: 'gateway.runtime.start',
+        resourceType: 'gateway_instance', resourceId: id,
+        afterState: { state: res.state, listeners: res.listeners },
+      });
+    });
+    return res;
+  });
+
+  app.post('/gateway/instances/:id/stop', { preHandler: guard('gateway:apply') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const actor = actorOf(req);
+    const exists = await q1<{ id: string }>('SELECT id FROM gateway_instances WHERE id = $1', [id]);
+    if (!exists) throw notFound('网关实例');
+
+    await stopRuntime(id);
+    await tx(async (t) => {
+      await audit(t, {
+        actorType: actor.kind, actorId: actor.id, action: 'gateway.runtime.stop',
+        resourceType: 'gateway_instance', resourceId: id,
+      });
+    });
+    return { ok: true, state: 'STOPPED' };
+  });
+
+  /** 实时快照：来自引擎内存，比库里的落盘值新 */
+  app.get('/gateway/instances/:id/runtime', { preHandler: guard('gateway:read') }, async (req) => {
+    const { id } = req.params as { id: string };
+    const row = await q1<Record<string, unknown>>(
+      `SELECT id, name, engine_kind, runtime_state, runtime_error, runtime_pid,
+              runtime_started_at, runtime_reload_at, listeners, bind_host
+       FROM gateway_instances WHERE id = $1`,
+      [id],
+    );
+    if (!row) throw notFound('网关实例');
+    return {
+      id: row.id,
+      name: row.name,
+      engineKind: row.engine_kind,
+      state: row.runtime_state,
+      error: row.runtime_error,
+      pid: row.runtime_pid,
+      startedAt: row.runtime_started_at,
+      reloadedAt: row.runtime_reload_at,
+      listeners: row.listeners,
+      live: runtimeSnapshot(id),
     };
   });
 

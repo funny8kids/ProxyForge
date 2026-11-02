@@ -6,6 +6,7 @@ import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
+import { applyRuntime } from '../modules/gateway/runtime.js';
 
 /**
  * Worker（与 API 同镜像、不同入口 —— 模块化单体，ADR-0001）。
@@ -168,8 +169,11 @@ async function periodic(): Promise<void> {
     for (const p of pools) {
       await recomputePool(p.id);
     }
-    // 成员变化后重新编译下发
-    await applyPolicies(await defaultInstanceId(), null);
+    // 成员变化后重新编译下发，并同步给运行时。
+    // 只编译不下发会让"池成员已经换了"和"端口上转发用的还是旧成员"长期不一致。
+    const primaryId = await defaultInstanceId();
+    await applyPolicies(primaryId, null);
+    await applyRuntime(primaryId);
     const hb = await q1<{ c: string }>('SELECT count(*)::text AS c FROM gateway_instances');
     if (Number(hb?.c ?? 0) > 0) {
       await exec('UPDATE proxy_nodes SET last_heartbeat_at = now()');

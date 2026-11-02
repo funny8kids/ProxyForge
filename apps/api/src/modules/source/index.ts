@@ -202,6 +202,25 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
     const { id } = req.params as { id: string };
     const body = req.body as Record<string, unknown>;
     const actor = actorOf(req);
+
+    /**
+     * 自动晋级开关。
+     *
+     * 之前只有 `/sources/catalog` 能设 `auto_promote`，于是 AI 发现的源
+     * 落进了一个死胡同：`runDiscoveryTask` 把它们入库（停用 + UNKNOWN），
+     * 用户手工启用之后发现还是不出节点 —— 因为没有任何接口能打开
+     * `auto_promote`，而 `sourcesWithBacklog()` 只挑 auto_promote=true 的源。
+     * 表现是"源启用成功、候选也在涨，但一个端点都不晋级"。
+     *
+     * 与 catalog 接口同一套约束：要开自动晋级就必须同时声明授权级别，
+     * 系统不替用户编一个 AUTHORIZED 出来。
+     */
+    const autoPromote = body.autoPromote === true;
+    const autoAuth = (body.authorization as string | undefined) ?? null;
+    if (autoPromote && autoAuth !== 'AUTHORIZED' && autoAuth !== 'RESTRICTED') {
+      throw invalid('autoPromote 必须同时声明 authorization（AUTHORIZED 或 RESTRICTED）');
+    }
+
     await tx(async (t) => {
       await t.exec(
         `UPDATE resource_sources SET
@@ -210,12 +229,16 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
            authorization_status = COALESCE($4::authorization_status, authorization_status),
            trust_level = COALESCE($5, trust_level),
            sync_interval_seconds = COALESCE($6, sync_interval_seconds),
-           notes = COALESCE($7, notes)
+           notes = COALESCE($7, notes),
+           auto_promote = CASE WHEN $8 THEN true ELSE auto_promote END,
+           auto_promote_authorization = CASE WHEN $8 THEN $9::authorization_status
+                                             ELSE auto_promote_authorization END
          WHERE id = $1`,
         [
           id, (body.name as string) ?? null, (body.enabled as boolean) ?? null,
           (body.authorizationStatus as string) ?? null, (body.trustLevel as number) ?? null,
           (body.syncIntervalSeconds as number) ?? null, (body.notes as string) ?? null,
+          autoPromote, autoAuth,
         ],
       );
       await audit(t, {

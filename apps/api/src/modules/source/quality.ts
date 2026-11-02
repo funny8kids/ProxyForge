@@ -36,19 +36,66 @@ import { exec, q } from '../../db/client.js';
  */
 
 const MIN_SAMPLE = 8;
-/** 低于这个分数进入"低分"计数 */
-const LOW_SCORE = 40;
+/**
+ * 低于这个分数才停用。
+ *
+ * 定在 30 而不是 40：免费公开代理的结构性存活率就在 10–20%，
+ * 用一个按自有代理设计的门槛去卡它，等于把所有源都判成差源。
+ * 30 分对应的实际表现是「存活率下界 15% 以下 + 平均质量 40 以下」，
+ * 那才是真的没救 —— 那种源挖下去只会浪费探测预算。
+ */
+const LOW_SCORE = 30;
 /** 连续两次低分才停用 */
 const DISABLE_AFTER_STREAK = 2;
-/** 低于这个分数降 trust_level */
-const DOWNWEIGHT_SCORE = 55;
+/**
+ * 低于这个分数降 trust_level。
+ *
+ * 原来是 55，配合"每 5 分钟重算一次"的实际效果是：任何分数在 40–55 的源
+ * 每轮掉 5 分，40 分钟撞到地板。而 40–55 恰恰是**免费代理源的正常区间**
+ * （存活率 20%、质量 70 的源算出来就是 46 分）。于是所有源最终都被降到
+ * 最低档，信任级这个字段就失去了区分能力 —— 实测一个贡献了 1,718 个
+ * 可用端点的源，信任级是全库最低的 10。
+ *
+ * 45 分对应「存活率下界约 20% 且质量偏低」，低于它才是真的异常。
+ */
+const DOWNWEIGHT_SCORE = 45;
 const TRUST_STEP = 5;
-const TRUST_FLOOR = 10;
+/**
+ * 信任级地板。
+ *
+ * 从 10 提到 25：10 这个值在界面上看起来像"已判死"，但那个源可能只是
+ * 阶段性地遇到一批失效 IP。25 仍然明确表达"这个源靠不住"，
+ * 又不至于让它在排序里被永久压在最后一位。
+ */
+const TRUST_FLOOR = 25;
 /** 恢复上限：建库默认信任级。超过它等于给源加分，那是人的判断 */
 const NEUTRAL_TRUST = 50;
 /** 恢复到这个分数以上，且已被停用超过 6 小时，自动重新启用 */
 const RECOVER_SCORE = 75;
 const RECOVER_AFTER_MS = 6 * 3600 * 1000;
+
+/**
+ * 存活率的 Wilson 下界（95% 置信）。
+ *
+ * 为什么不用 `alive / total`：这个比值在小样本上完全不可靠。
+ * 一个源探了 3 个端点、活了 2 个，裸比例是 67% —— 比一个探了 800 个、
+ * 活了 400 个（50%）的源"更好"，而这显然荒谬。免费代理源刚导入时样本
+ * 常常只有个位数，用裸比例会让评分在头几轮剧烈跳动，信任级跟着乱降。
+ *
+ * Wilson 下界的做法是"给样本量少的比例打折"：同样 50%，样本 800 时下界
+ * 约 0.465，样本 3 时下界只有 0.208。它回答的问题是
+ * **"这个源的存活率至少是多少"**，而不是"目前观测到多少" ——
+ * 前者才是决定"要不要继续从这个源挖"的依据。
+ */
+export function wilsonLower(alive: number, total: number, z = 1.96): number {
+  if (total <= 0) return 0;
+  const p = alive / total;
+  const z2 = z * z;
+  const denom = 1 + z2 / total;
+  const centre = p + z2 / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total));
+  return Math.max(0, Math.min(1, (centre - margin) / denom));
+}
 
 export interface QualityOutcome {
   sourceId: string;
@@ -136,18 +183,33 @@ export async function recomputeSourceQuality(): Promise<QualityOutcome[]> {
     }
 
     const aliveRatio = alive / total;
-    let score = 0.55 * (avgQuality ?? 0) + 0.45 * (aliveRatio * 100);
+    const survivalFloor = wilsonLower(alive, total);
+    let score = 0.55 * (avgQuality ?? 0) + 0.45 * (survivalFloor * 100);
     if (s.last_sync_status === 'FAILED') score -= 25;
     score = Math.max(0, Math.min(100, Math.round(score * 100) / 100));
-    const lowStreak = score < LOW_SCORE ? s.quality_low_streak + 1 : 0;
+
+    // `lowStreak` 的口径统一到 DOWNWEIGHT_SCORE 上：它表示"连续几轮表现不佳"，
+    // 而不是"连续几轮低于 40 分"。
+    //
+    // 原来只统计低于 40 的次数，于是 40–55 这个区间变成了无主地带 ——
+    // 分数已经低到该降权（<55），但 streak 一直是 0，降权分支只看分数
+    // 不看 streak，结果是**每 5 分钟重算一次就降 5 分**，一小时能降 60 分，
+    // 直接撞到地板 10。这就是"贡献了最多可用节点的源，信任级反而是全库最低"
+    // 的成因：不是它真的差，是降权没有节流。
+    const lowStreak = score < DOWNWEIGHT_SCORE ? s.quality_low_streak + 1 : 0;
     const authorized = s.authorization_status === 'AUTHORIZED';
 
     let action: QualityOutcome['action'] = 'none';
-    let detail = `存活 ${alive}/${total}（${(aliveRatio * 100).toFixed(0)}%），平均质量 ${(avgQuality ?? 0).toFixed(0)}`;
+    let detail =
+      `存活 ${alive}/${total}（${(aliveRatio * 100).toFixed(0)}%，` +
+      `下界 ${(survivalFloor * 100).toFixed(0)}%），平均质量 ${(avgQuality ?? 0).toFixed(0)}`;
 
     // ── 自动停用 ──
+    // 门槛比降权更严：既要连续不佳，分数还得真的跌破 LOW_SCORE。
+    // 只看 streak 会在 41 分就把一个能用的源关掉。
     if (
       lowStreak >= DISABLE_AFTER_STREAK &&
+      score < LOW_SCORE &&
       s.enabled &&
       !authorized
     ) {

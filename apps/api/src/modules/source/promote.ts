@@ -1,5 +1,5 @@
 import type { ProxyProtocol } from '@proxyforge/contracts';
-import type { TxLike } from '../../db/client.js';
+import { exec, type TxLike } from '../../db/client.js';
 import { uuidv7 } from '../../shared/id.js';
 
 /**
@@ -34,6 +34,7 @@ export async function promoteCandidates(
     `SELECT id, protocol, host, port, dedupe_key
      FROM candidate_endpoints
      WHERE source_id = $1 AND review_status = 'PENDING'
+       AND stale_at IS NULL
        AND host IS NOT NULL AND port IS NOT NULL AND protocol IS NOT NULL
      ORDER BY created_at ASC
      LIMIT $2`,
@@ -43,7 +44,7 @@ export async function promoteCandidates(
   if (!pending.length) {
     const rest = await t.q1<{ n: number }>(
       `SELECT count(*)::int AS n FROM candidate_endpoints
-       WHERE source_id = $1 AND review_status = 'PENDING'`,
+       WHERE source_id = $1 AND review_status = 'PENDING' AND stale_at IS NULL`,
       [sourceId],
     );
     return { promoted: 0, duplicate: 0, remaining: rest?.n ?? 0 };
@@ -105,9 +106,80 @@ export async function promoteCandidates(
 
   const rest = await t.q1<{ n: number }>(
     `SELECT count(*)::int AS n FROM candidate_endpoints
-     WHERE source_id = $1 AND review_status = 'PENDING'`,
+     WHERE source_id = $1 AND review_status = 'PENDING' AND stale_at IS NULL`,
     [sourceId],
   );
 
   return { promoted, duplicate, remaining: rest?.n ?? 0 };
+}
+
+/**
+ * 候选过期标记。
+ *
+ * 解决的问题：候选池会累积到五万条量级，而每轮晋级受探测吞吐约束只能吃下
+ * 几百条。达到"健康节点够用"的目标后闸门关闭，剩下的候选就一直停在 PENDING，
+ * 界面上的「待晋级 51,000」看起来像系统卡住了 —— 实际上那是目标达成后的正常状态。
+ *
+ * 更实际的影响是它污染排序：`pendingCandidates` 被用作晋级权重，
+ * 一个早就被挖空的源靠这个虚高数字能永远排在待挖列表最前面。
+ *
+ * 保留期 7 天是宽松的：按 400 条/轮、15 秒一轮算，一天能消化两百万条，
+ * 五万条积压不到半小时就该轮完一遍。超过 7 天还没被碰过的候选，
+ * 只可能是闸门一直关着 —— 那正是该标过期的情形。
+ */
+export async function expireStaleCandidates(days = 7): Promise<number> {
+  return exec(
+    `UPDATE candidate_endpoints
+        SET stale_at = now()
+      WHERE review_status = 'PENDING'
+        AND stale_at IS NULL
+        AND created_at < now() - ($1 || ' days')::interval`,
+    [String(days)],
+  );
+}
+
+/**
+ * 删除长期过期的候选。
+ *
+ * 标 stale 只是让它不再计入积压，行本身还在。19 个源累计五万多行，
+ * 单表几万行不算大，但它是**永久增长**的：每个源每小时同步一次、
+ * 每次新增几百条，一年后就是百万级 —— 而其中 99% 永远不会被晋级。
+ *
+ * 保留 30 天：免费代理的 IP 生命周期常常不到一周，一个月前的候选
+ * 复活过来也基本是死的。真要复活就重新同步一次，比留着历史行可靠。
+ *
+ * 只删 `review_status = 'PENDING'` 的：PROMOTED 的行是指向端点的溯源链，
+ * DUPLICATE / REJECTED 是审核结论，都不该被清理。
+ */
+export async function pruneStaleCandidates(days = 30): Promise<number> {
+  return exec(
+    `DELETE FROM candidate_endpoints
+      WHERE review_status = 'PENDING'
+        AND stale_at IS NOT NULL
+        AND stale_at < now() - ($1 || ' days')::interval`,
+    [String(days)],
+  );
+}
+
+/**
+ * 复活一批过期候选。
+ *
+ * 只在「健康数掉回目标以下、闸门重新打开」时调用 —— 那时需要新候选补充，
+ * 而全量复活五万条会让闸门立刻又被积压顶住，等于没做。
+ *
+ * 取最近的若干条而不是最老的：免费代理时效性极强，一周前的 IP 复活过来
+ * 大概率已经换了主人，探测它纯属浪费预算。
+ */
+export async function reviveStaleCandidates(limit = 2000): Promise<number> {
+  return exec(
+    `UPDATE candidate_endpoints
+        SET stale_at = NULL
+      WHERE id IN (
+        SELECT id FROM candidate_endpoints
+        WHERE review_status = 'PENDING' AND stale_at IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT $1
+      )`,
+    [limit],
+  );
 }

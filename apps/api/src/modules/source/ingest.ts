@@ -1,6 +1,12 @@
 import { q, tx } from '../../db/client.js';
 import { syncSource, type SourceRow } from './index.js';
-import { promoteCandidates, type PromoteAuthorization } from './promote.js';
+import {
+  expireStaleCandidates,
+  promoteCandidates,
+  reviveStaleCandidates,
+  type PromoteAuthorization,
+} from './promote.js';
+import { wilsonLower } from './quality.js';
 
 /**
  * 自动采集流水线。
@@ -30,11 +36,14 @@ const SOURCES_PER_CYCLE = 3;
 /**
  * 目标健康节点数。
  *
- * 实验池上限 120，留一点余量：健康节点会随时间掉线，需要替补。
- * 达到这个数量后不再晋级新候选 —— 免费代理的边际价值到此为止，
- * 继续抓只会把探测预算浪费在 80% 的死节点上。
+ * 与实验池上限联动：池上限 300，健康节点会随时间掉线（免费代理日掉线率
+ * 两位数），需要替补余量。400 大约留出 30% 的缓冲 —— 低于这个数说明
+ * 池子开始缺人，该继续挖了。
+ *
+ * 这个数字也是"什么时候该停止扫描别人服务器"的开关：达到之后闸门关闭，
+ * 不再晋级新候选，探测预算只用于复探已有节点。
  */
-const TARGET_HEALTHY = Number(process.env.PF_INGEST_TARGET_HEALTHY ?? 150);
+const TARGET_HEALTHY = Number(process.env.PF_INGEST_TARGET_HEALTHY ?? 400);
 
 /** 单轮晋级总预算。PGlite 单写者，一轮塞太多会让 API 失去响应。 */
 const PROMOTE_BUDGET = Number(process.env.PF_INGEST_PROMOTE_BUDGET ?? 1500);
@@ -52,6 +61,10 @@ const PROMOTE_BUDGET = Number(process.env.PF_INGEST_PROMOTE_BUDGET ?? 1500);
  * 400 相当于不到 2 分钟的缓冲，既不会让探测饿着，也不会让库无谓膨胀。
  */
 const PROBE_BACKLOG_MAX = Number(process.env.PF_INGEST_PROBE_BACKLOG ?? 400);
+
+/** 过期标记的扫描间隔。清理语义，早一小时晚一小时没有影响。 */
+const STALE_SWEEP_MS = 60 * 60 * 1000;
+let lastStaleSweep = 0;
 
 export interface IngestSourceResult {
   key: string;
@@ -143,24 +156,68 @@ async function countAwaitingProbe(): Promise<number> {
   return Number(row[0]?.c ?? 0);
 }
 
-/** 有积压候选、且开启了自动晋级的源。按积压量从大到小，先把大的清掉。 */
-async function sourcesWithBacklog(): Promise<DueSourceRow[]> {
-  return q<DueSourceRow>(
+/** 有积压候选、且开启了自动晋级的源。按**期望产出**排序，不是按积压量。 */
+interface BacklogSource extends DueSourceRow {
+  pending: number;
+  tried: number;
+  alive: number;
+}
+
+/**
+ * 从各源挖候选时的排序依据。
+ *
+ * 原来按积压量降序，等于假设"候选多的源更值得挖"。这个假设在免费代理场景下
+ * 是错的：一个 11,000 条候选的源如果存活率只有 2%，挖 200 条只得 4 个可用节点；
+ * 一个 900 条候选、存活率 45% 的源挖 200 条能得 90 个。按积压量排会让探测预算
+ * 长期压在低产出的源上 —— 实测就是这么发生的：最大的源贡献了 11,099 条候选，
+ * 却只产出 200 个端点，而一个只有 4,924 条的源产出了 1,718 个。
+ *
+ * 期望产出 = 积压量 × 存活率下界。用下界而不是裸比例，是为了不让
+ * "探了 3 个活了 2 个"的源拿到虚高的优先级（见 quality.ts 里的 Wilson 说明）。
+ *
+ * 没有探测历史的源给一个乐观先验 0.25：免费代理整体存活率在 10–20% 之间，
+ * 但完全不给机会会让新源永远排不上队，而新源恰恰是最可能带来增量的。
+ */
+const OPTIMISTIC_PRIOR = 0.25;
+
+async function sourcesWithBacklog(): Promise<BacklogSource[]> {
+  const rows = await q<BacklogSource>(
     `SELECT s.id, s.key, s.name, s.type, s.url, s.format_hint, s.authorization_status, s.config,
-            s.auto_promote, s.auto_promote_authorization, s.auto_promote_limit
+            s.auto_promote, s.auto_promote_authorization, s.auto_promote_limit,
+            COALESCE(b.pending, 0)::int AS pending,
+            COALESCE(p.tried, 0)::int AS tried,
+            COALESCE(p.alive, 0)::int AS alive
      FROM resource_sources s
+     LEFT JOIN (
+       SELECT source_id, count(*)::int AS pending
+       FROM candidate_endpoints
+       WHERE review_status = 'PENDING' AND stale_at IS NULL
+       GROUP BY source_id
+     ) b ON b.source_id = s.id
+     LEFT JOIN (
+       SELECT es.source_id,
+              count(*)::int AS tried,
+              count(*) FILTER (
+                WHERE e.lifecycle_status IN ('HEALTHY','DEGRADED','VERIFIED')
+              )::int AS alive
+       FROM endpoint_sources es
+       JOIN proxy_endpoints e ON e.id = es.endpoint_id AND e.deleted_at IS NULL
+       JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+       WHERE hs.last_check_at IS NOT NULL
+       GROUP BY es.source_id
+     ) p ON p.source_id = s.id
      WHERE s.enabled = true
        AND s.auto_promote = true
        AND s.auto_promote_authorization IN ('AUTHORIZED', 'RESTRICTED')
-       AND EXISTS (
-         SELECT 1 FROM candidate_endpoints c
-         WHERE c.source_id = s.id AND c.review_status = 'PENDING'
-       )
-     ORDER BY (
-       SELECT count(*) FROM candidate_endpoints c
-       WHERE c.source_id = s.id AND c.review_status = 'PENDING'
-     ) DESC`,
+       AND COALESCE(b.pending, 0) > 0`,
   );
+
+  const scored = rows.map((r) => {
+    const rate = r.tried > 0 ? wilsonLower(r.alive, r.tried) : OPTIMISTIC_PRIOR;
+    return { row: r, expectedYield: r.pending * rate };
+  });
+  scored.sort((a, b) => b.expectedYield - a.expectedYield);
+  return scored.map((s) => s.row);
 }
 
 export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestResult> {
@@ -198,7 +255,18 @@ export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestR
     pauseReason = 'probe-backlog';
   } else {
     const room = PROBE_BACKLOG_MAX - awaitingProbe;
-    const backlog = await sourcesWithBacklog();
+    let backlog = await sourcesWithBacklog();
+
+    // 活跃候选挖完了但健康数还没达标 —— 说明候选池被过期标记扫空了。
+    // 不复活的话闸门是开着的，却永远挖不到东西，而日志上只会显示"晋级 0 个"。
+    if (backlog.length === 0) {
+      const revived = await reviveStaleCandidates();
+      if (revived > 0) {
+        console.log(`[worker] 复活 ${revived} 条过期候选（健康数未达标，需要补充）`);
+        backlog = await sourcesWithBacklog();
+      }
+    }
+
     let remaining = Math.min(PROMOTE_BUDGET, room);
 
     for (const source of backlog) {
@@ -223,6 +291,16 @@ export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestR
           promoted: r.promoted, duplicate: r.duplicate,
         });
       }
+    }
+  }
+
+  // 过期标记是整表 UPDATE，没必要每 15 秒跑一次；而且它是"清理"语义，
+  // 早一小时晚一小时对结果没有影响。
+  if (Date.now() - lastStaleSweep > STALE_SWEEP_MS) {
+    lastStaleSweep = Date.now();
+    const expired = await expireStaleCandidates();
+    if (expired > 0) {
+      console.log(`[worker] 标记 ${expired} 条候选过期（超过保留期未被晋级）`);
     }
   }
 

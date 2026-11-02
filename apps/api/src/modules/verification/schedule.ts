@@ -363,3 +363,25 @@ export async function pruneSchedulerJobs(keepDays = 7): Promise<number> {
     [String(keepDays)],
   );
 }
+
+/**
+ * 清理全部终态验证任务。
+ *
+ * 与 `pruneSchedulerJobs` 的区别是**不再按 filter 过滤**：那个函数只清
+ * 调度器自动建的批次，手工发起和池级发起的任务永远留在表里。表本身不大，
+ * 但 `/verification/jobs` 是分页查询，而 `health_checks.job_id` 也指向它 ——
+ * 留着几万条已完成的旧任务，每次翻历史都要扫过它们。
+ *
+ * 保留期比调度任务长（30 天 vs 7 天）：手工任务的批次是人工操作的凭据，
+ * 出问题时要能回溯"上周那次全量探测跑了什么"。调度任务每 15 秒一条，
+ * 只对最近几轮有意义。
+ */
+export async function pruneFinishedJobs(keepDays = 30): Promise<number> {
+  return exec(
+    `DELETE FROM verification_jobs
+      WHERE status IN ('SUCCEEDED','FAILED','CANCELLED')
+        AND filter <> ${SCHEDULER_MARK}
+        AND created_at < now() - ($1 || ' days')::interval`,
+    [String(keepDays)],
+  );
+}

@@ -65,7 +65,12 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
               COALESCE(c.promoted, 0) AS promoted
        FROM resource_sources s
        LEFT JOIN LATERAL (
-         SELECT count(*) FILTER (WHERE review_status = 'PENDING')::int  AS pending,
+         -- pending 只算**活跃**候选：被标过期的那些既不会被晋级，也不该
+         -- 显示成"待处理积压"。一个恒定的「待晋级 51,000」会让界面看起来
+         -- 像卡住了，而实际上那是目标达成后的正常状态。
+         SELECT count(*) FILTER (
+                  WHERE review_status = 'PENDING' AND stale_at IS NULL
+                )::int                                                  AS pending,
                 count(*)::int                                           AS total,
                 count(*) FILTER (WHERE review_status = 'PROMOTED')::int AS promoted
          FROM candidate_endpoints ce WHERE ce.source_id = s.id
@@ -204,12 +209,13 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
            enabled = COALESCE($3, enabled),
            authorization_status = COALESCE($4::authorization_status, authorization_status),
            trust_level = COALESCE($5, trust_level),
-           sync_interval_seconds = COALESCE($6, sync_interval_seconds)
+           sync_interval_seconds = COALESCE($6, sync_interval_seconds),
+           notes = COALESCE($7, notes)
          WHERE id = $1`,
         [
           id, (body.name as string) ?? null, (body.enabled as boolean) ?? null,
           (body.authorizationStatus as string) ?? null, (body.trustLevel as number) ?? null,
-          (body.syncIntervalSeconds as number) ?? null,
+          (body.syncIntervalSeconds as number) ?? null, (body.notes as string) ?? null,
         ],
       );
       await audit(t, {

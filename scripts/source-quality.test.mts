@@ -144,16 +144,21 @@ console.log('\n[2] 健康来源');
 const good = await mkSource({ key: 'good' });
 await mkNodes(good, { n: 8, alive: 8, quality: 90 });
 
-await check('8 个全 HEALTHY、质量 90 → 94.5 分，信任级从 40 恢复到 45', async () => {
+await check('8 个全 HEALTHY、质量 90 → 79.9 分，信任级从 40 恢复到 45', async () => {
   const r = pick(await recomputeSourceQuality(), 'good');
-  // 信任级是双向的：低于 55 扣 5，高于 75 还 5。
+  // 信任级是双向的：低于 45 扣 5，高于 75 还 5。
   // 没有"还"这一半的话，一次误判（或我们自己的取样口径出错）
   // 会变成永久惩罚 —— 而 trust_level 表达的应该是"最近的表现"。
   assert.equal(r.action, 'trust-restored');
-  // 0.55 * 90 + 0.45 * 100
-  assert.equal(r.score, 94.5);
+  // 0.55 * 90 + 0.45 * wilsonLower(8, 8)
+  //
+  // 存活率用的是 Wilson 下界而不是裸比例。8 个样本全活，裸比例是 100%，
+  // 下界只有 67.6% —— 那正是我们想要的态度：样本少就别说满话。
+  // 用裸比例时这里算出来是 94.5 分，一个只探过 8 个节点的源能拿到
+  // 接近满分，而它下一轮可能就掉一半。
+  assert.equal(r.score, 79.9);
   const row = await sourceRow(good);
-  assert.equal(row.quality_score, '94.50');
+  assert.equal(row.quality_score, '79.90');
   assert.equal(row.trust_level, 45);
 });
 
@@ -173,9 +178,10 @@ console.log('\n[3] 低分降权');
 const bad = await mkSource({ key: 'bad', trust: 40 });
 await mkNodes(bad, { n: 8, alive: 2, quality: 20 });
 
-await check('存活 2/8、质量 20 → 22.25 分，信任级 40 → 35', async () => {
+await check('存活 2/8、质量 20 → 14.22 分，信任级 40 → 35', async () => {
   const r = pick(await recomputeSourceQuality(), 'bad');
-  assert.equal(r.score, 22.25);
+  // 0.55 * 20 + 0.45 * wilsonLower(2, 8) = 11 + 0.45 * 7.15
+  assert.equal(r.score, 14.22);
   assert.equal(r.action, 'downweighted');
   const row = await sourceRow(bad);
   assert.equal(row.trust_level, 35);
@@ -261,9 +267,10 @@ console.log('\n[7] 同步失败扣分');
 const failing = await mkSource({ key: 'sync-failing', trust: 100, lastSync: 'FAILED' });
 await mkNodes(failing, { n: 8, alive: 8, quality: 60 });
 
-await check('全健康但上次同步失败 → 78 - 25 = 53 分，落到降权区间', async () => {
+await check('全健康但上次同步失败 → 63.4 - 25 = 38.4 分，落到降权区间', async () => {
   const r = pick(await recomputeSourceQuality(), 'sync-failing');
-  assert.equal(r.score, 53);
+  // 0.55 * 60 + 0.45 * wilsonLower(8, 8) = 33 + 30.4，再扣同步失败的 25
+  assert.equal(r.score, 38.4);
   assert.equal(r.action, 'downweighted');
   assert.equal((await sourceRow(failing)).trust_level, 95);
 });

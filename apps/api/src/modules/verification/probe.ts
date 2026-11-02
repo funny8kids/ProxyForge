@@ -490,15 +490,33 @@ const errText = (err: unknown): string =>
 // 成功率权重最高——一个 20ms 但 60% 失败率的节点毫无价值
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * 质量分。
+ *
+ * 成功率占 70 分 —— 一个 20ms 但 60% 失败率的节点毫无价值，这条权重不该被
+ * 延迟挤掉。延迟 20 分、抖动 10 分。
+ *
+ * 延迟分档刻意定在「300ms 满分 / 3000ms 归零」，而不是最初的
+ * 「100ms 满分 / 2000ms 归零」。原因不是心软，是**区分度**：
+ * 免费公开代理的 p50 实测集中在 500–900ms（跨境链路，物理下限摆在那里），
+ * 按 100ms 满分算，600ms 和 1200ms 都挤在 14 分和 8 分之间，
+ * 而这两者的实际体验差一倍。档位贴合真实分布，排序才有意义 ——
+ * 用户从 300 个节点里挑前 20 个，靠的就是这个排序。
+ *
+ * 为什么不把「代理到探测目标的跨境 RTT」从延迟里剔出去：那部分确实是
+ * 地理距离造成的，但免费代理的用途本来就是访问境外服务，跨境 RTT 是
+ * 用户真实承担的成本，不是测量噪声。剔掉它反而会让一批"本地很快、
+ * 出网很慢"的节点排到前面去。
+ */
 export function qualityScore(input: {
   successRate: number;
   p50Ms: number | null;
   jitterMs: number | null;
 }): number {
   const ratePart = input.successRate * 70; // 70 分权重
+  // 从未成功过的节点 p50 是 null，按最差档算 —— 不能当成"0ms 很快"
   const latency = input.p50Ms ?? 3000;
-  // 100ms 内满分 20，2000ms 归零
-  const latencyPart = Math.max(0, Math.min(20, ((2000 - latency) / 1900) * 20));
+  const latencyPart = Math.max(0, Math.min(20, ((3000 - latency) / 2700) * 20));
   const jitter = input.jitterMs ?? 500;
   const jitterPart = Math.max(0, Math.min(10, ((400 - jitter) / 400) * 10));
   return Math.round((ratePart + latencyPart + jitterPart) * 100) / 100;

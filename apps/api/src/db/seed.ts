@@ -195,14 +195,18 @@ export async function seed(): Promise<void> {
   const sourceGithub = uuidv7();
   const sourceFeed = uuidv7();
   await exec(
-    `INSERT INTO resource_sources (id, key, name, type, url, format_hint, authorization_status, trust_level, last_synced_at, enabled)
+    `INSERT INTO resource_sources (id, key, name, type, url, format_hint, authorization_status, trust_level, last_synced_at, enabled, notes)
      VALUES
-       ($1,'manual-paste','Manual Paste','MANUAL',NULL,'text','AUTHORIZED',70, now(), true),
+       ($1,'manual-paste','Manual Paste','MANUAL',NULL,'text','AUTHORIZED',70, now(), true, NULL),
        -- 下面两个是占位示例，URL 指向 example.com。默认停用：留着 enabled=true 会让
        -- 每次「全部同步」都稳定产生 2 条 HTTP 404，把真正的失败淹没掉。
        -- 真实公开源由 POST /sources/catalog 导入（shared/sources-catalog.ts）。
-       ($2,'gh-proxy-list','GitHub Proxy List','GITHUB_REPO','https://example.com/proxies.txt','text','UNKNOWN',40, now() - interval '2 hours', false),
-       ($3,'vendor-feed-a','Vendor Feed A','API','https://example.com/api/proxies','json','AUTHORIZED',80, now() - interval '20 minutes', false)`,
+       -- notes 必须写清楚：否则界面上它们就是两个"有名字、有信任级、但一条数据都没有"
+       -- 的源，看起来像同步坏了，而实际上它们只是演示用的占位。
+       ($2,'gh-proxy-list','GitHub Proxy List','GITHUB_REPO','https://example.com/proxies.txt','text','UNKNOWN',40, now() - interval '2 hours', false,
+          '占位示例源，URL 指向 example.com，不会产出数据。真实公开源请从内置源目录导入。'),
+       ($3,'vendor-feed-a','Vendor Feed A','API','https://example.com/api/proxies','json','AUTHORIZED',80, now() - interval '20 minutes', false,
+          '占位示例源，URL 指向 example.com，不会产出数据。真实公开源请从内置源目录导入。')`,
     [sourceManual, sourceGithub, sourceFeed],
   );
 
@@ -335,7 +339,7 @@ export async function seed(): Promise<void> {
        ($1,'STATIC_STABLE','Static Stable','长期稳定出口，仅限自有与已验证资源','production egress',70,40,
           '{PRIVATE_PROXY,VERIFIED_PROXY}'::trust_tier[], false, 0),
        ($2,'PUBLIC_EXPERIMENTAL','Public Experimental','公开代理实验池。可用性不等于合法性，不承担生产流量。',
-          'connectivity experiments',0,120,'{PUBLIC_PROXY}'::trust_tier[], true, 0),
+          'connectivity experiments',50,300,'{PUBLIC_PROXY}'::trust_tier[], true, 0),
        ($3,'LOW_LATENCY_APAC','Low Latency APAC','亚太低延迟场景','regional acceleration',60,25,
           '{PRIVATE_PROXY,VERIFIED_PROXY}'::trust_tier[], false, 0)`,
     [poolStable, poolExperimental, poolFast],

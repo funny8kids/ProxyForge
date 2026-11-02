@@ -48,27 +48,50 @@ export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   REVOKED: null,
 };
 
-/** 档位优先级：数字大的先探。新候选最急，隔离的只做低频复查。 */
-const TIER_PRIO: Record<string, number> = {
-  DISCOVERED: 90,
-  PENDING_VERIFICATION: 90,
-  DEGRADED: 70,
-  VERIFIED: 50,
-  UNAVAILABLE: 40,
-  HEALTHY: 20,
-  QUARANTINED: 10,
-};
+/**
+ * 各档位的复探配额占比，以及探测价值优先级。
+ *
+ * 为什么需要配额：七个档位在抢同一份探测预算，而它们之间没有天然的"汇率"。
+ * 按超期倍数排，欠得久但没价值的探测会插到关键路径前面 —— 实测后果是
+ * VERIFIED 被 PENDING 永久饿死（PENDING 超期 20 分钟算 2.0 倍，
+ * VERIFIED 超期 5 分钟算 0.33 倍），`VERIFIED total` 一直涨而 `HEALTHY`
+ * 一个不增，看起来像"节点质量差"，实际是确认探测根本没发生。
+ *
+ * 按优先级排（VERIFIED 绝对优先）能救活关键路径，但会把 HEALTHY 饿死 ——
+ * 那样订阅里会长期留着已经死掉的节点，比不产出更糟。
+ *
+ * 两边都要保，就只能显式分配：每档一个保底份额，用不完的余量再按优先级
+ * 让给别的档。这样"任何一档都不会饿死"是构造出来的，不是靠排序碰巧。
+ *
+ * 份额依据是**这一档的探测有多重要**：
+ *   VERIFIED 45% —— 通往 HEALTHY 的唯一关键路径，整条链路的产出速度由它决定
+ *   DEGRADED 15% —— 已经在用而且正在坏，探它能决定要不要摘掉
+ *   PENDING 15%  —— 可能是新的可用节点，但九成是死的
+ *   HEALTHY 12%  —— 确认已知结论，但必须探：否则死节点会一直留在订阅里
+ *   其余 13%     —— DISCOVERED / UNAVAILABLE / QUARANTINED 的低频复核
+ */
+const TIER_PLAN: Array<{ status: string; share: number; prio: number }> = [
+  { status: 'VERIFIED', share: 0.45, prio: 100 },
+  { status: 'DEGRADED', share: 0.15, prio: 85 },
+  { status: 'PENDING_VERIFICATION', share: 0.15, prio: 70 },
+  { status: 'DISCOVERED', share: 0.05, prio: 70 },
+  { status: 'HEALTHY', share: 0.12, prio: 60 },
+  { status: 'UNAVAILABLE', share: 0.05, prio: 40 },
+  { status: 'QUARANTINED', share: 0.03, prio: 10 },
+];
 
 /**
- * 把档位表编译成 SQL VALUES。
+ * 把档位表编译成 SQL VALUES (status, minutes, prio, share)。
  *
  * 之前这段 SQL 是手写的字面量，于是"改了 TIER_INTERVAL_MIN 但忘了改 SQL"
  * 会静默生效于一半代码路径：界面按新间隔算 due，调度器按旧间隔入队。
  * 两边都不报错，只是数字对不上。让它从同一份常量生成，这类分叉就不可能发生。
  */
-const TIER_VALUES = Object.keys(TIER_PRIO)
-  .map((s) => `('${s}',${TIER_INTERVAL_MIN[s]},${TIER_PRIO[s]})`)
-  .join(', ');
+const TIER_VALUES = TIER_PLAN.map((t) => {
+  const minutes = TIER_INTERVAL_MIN[t.status];
+  if (minutes === undefined) throw new Error(`档位 ${t.status} 缺少间隔定义`);
+  return `('${t.status}',${minutes},${t.prio},${t.share})`;
+}).join(', ');
 
 /**
  * 每 tick 的探测预算。
@@ -131,14 +154,15 @@ const DUE_PREDICATE = `(
 const FRESH_SHARE = 0.5;
 
 /**
- * 复探排序：按"超期倍数"。
+ * 超期倍数 = 已等待时长 / 该档周期。同档内按它排序。
  *
- * 超期倍数而不是绝对时间：一个健康节点 6 小时该复核、一个降级节点 30 分钟该复核，
+ * 用它而不是绝对时间：一个健康节点 6 小时该复核、一个降级节点 30 分钟该复核，
  * 后者超期 30 分钟比前者超期 1 小时更急。用绝对时间排序会让慢档位永远排不上。
+ *
+ * 档位**之间**不按它排 —— 那会让欠得久但没价值的探测插到关键路径前面，
+ * 档位之间的分配由 TIER_PLAN 的 share 保证（见该常量注释）。
  */
-const OVERDUE_ORDER = `
-  EXTRACT(EPOCH FROM (now() - hs.last_check_at)) / (t.minutes * 60) DESC,
-  t.prio DESC`;
+const OVERDUE_RATIO = `EXTRACT(EPOCH FROM (now() - hs.last_check_at)) / (t.minutes * 60)`;
 
 /**
  * 回收僵死任务。
@@ -178,11 +202,11 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
   );
   if (busy.length > 0) return { jobId: null, picked: 0, reason: 'busy' };
 
-  // 首次探测与复探分开取，各自有配额 —— 详见 FRESH_SHARE 的注释。
+  // 首次探测与复探分开取，各自有配额 —— 详见 FRESH_SHARE 与 TIER_PLAN 的注释。
   const freshQuota = Math.max(1, Math.ceil(batch * FRESH_SHARE));
 
   const fresh = await q<{ id: string }>(
-    `WITH tier(status, minutes, prio) AS (
+    `WITH tier(status, minutes, prio, share) AS (
        VALUES ${TIER_VALUES}
      )
      SELECT e.id
@@ -198,28 +222,43 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
 
   // 复探配额 = 剩余额度。首次探测不足时，余量全部让给复探。
   const recheckQuota = batch - fresh.length;
+  // 每档用 row_number 取"该档内欠得最多的前 share 比例个"，实现保底份额。
+  // 用窗口函数而不是发 7 条查询：一次扫描就够，也不用担心七次扫描之间
+  // 数据变了导致份额被打破。
   const recheck = recheckQuota > 0
-    ? await q<{ id: string }>(
-        `WITH tier(status, minutes, prio) AS (
-           VALUES ${TIER_VALUES}
-         )
-         SELECT e.id
-         FROM proxy_endpoints e
-         JOIN tier t ON t.status = e.lifecycle_status::text
-         JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
-         WHERE e.deleted_at IS NULL
-           AND hs.last_check_at <= now() - (t.minutes || ' minutes')::interval
-         ORDER BY ${OVERDUE_ORDER}
-         LIMIT $1`,
-        [recheckQuota],
-      )
+    ? (
+        await q<{ id: string }>(
+          `WITH tier(status, minutes, prio, share) AS (
+             VALUES ${TIER_VALUES}
+           ), cand AS (
+             SELECT e.id,
+                    e.lifecycle_status::text AS status,
+                    ${OVERDUE_RATIO} AS ratio,
+                    row_number() OVER (
+                      PARTITION BY e.lifecycle_status
+                      ORDER BY ${OVERDUE_RATIO} DESC
+                    ) AS rn
+             FROM proxy_endpoints e
+             JOIN tier t ON t.status = e.lifecycle_status::text
+             JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+             WHERE e.deleted_at IS NULL
+               AND hs.last_check_at <= now() - (t.minutes || ' minutes')::interval
+           )
+           SELECT c.id
+           FROM cand c
+           JOIN tier t ON t.status = c.status
+           WHERE c.rn <= GREATEST(1, ceil($1::numeric * t.share))
+           ORDER BY t.prio DESC, c.ratio DESC`,
+          [recheckQuota],
+        )
+      ).slice(0, recheckQuota)
     : [];
 
   // 复探不足时，把余量还给首次探测 —— 否则新端点排队却白占着批次额度。
   const spare = batch - fresh.length - recheck.length;
   const extraFresh = spare > 0
     ? await q<{ id: string }>(
-        `WITH tier(status, minutes, prio) AS (
+        `WITH tier(status, minutes, prio, share) AS (
            VALUES ${TIER_VALUES}
          )
          SELECT e.id

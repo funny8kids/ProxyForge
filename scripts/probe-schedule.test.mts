@@ -155,17 +155,35 @@ await check('DEGRADED 超过 30 分钟 → 入队；未满 30 分钟的不入队
   await clearSchedulerJobs();
 });
 
-console.log('\n[3] 排序：超期倍数优先');
+console.log('\n[3] 排序与优先级');
 
-await check('HEALTHY 超期 10 倍 排在 DISCOVERED 超期 1.1 倍 之前', async () => {
-  // 清空可调度范围，只留这两个
+await check('同档内：超期更狠的先探', async () => {
+  // 档位之间靠份额保底（见 [3b]），档位内部靠超期倍数。
+  // 用绝对时间排会让"6 小时周期的节点超期 1 小时"排在
+  // "30 分钟周期的节点超期 30 分钟"前面，后者其实更急。
   await settleAllEndpoints();
-  const healthy = await mkEndpoint('HEALTHY', 3600);   // 360 分钟周期，超期 10 倍
-  const fresh = await mkEndpoint('DISCOVERED', 11);    // 10 分钟周期，超期 1.1 倍
+  await clearSchedulerJobs();
+  const older = await mkEndpoint('HEALTHY', 3600); // 360 分钟周期，超期 10 倍
+  const newer = await mkEndpoint('HEALTHY', 400); // 超期 1.1 倍
   const r = await enqueueDueProbes();
   const ids = await jobEndpointIds(r.jobId!);
-  assert.equal(ids[0], healthy, '超期更狠的应该先探，否则慢周期节点会饿死快周期节点');
-  assert.ok(ids.includes(fresh));
+  assert.ok(ids.includes(older) && ids.includes(newer));
+  assert.ok(ids.indexOf(older) < ids.indexOf(newer), '同档内欠得多的先探');
+  await clearSchedulerJobs();
+});
+
+await check('VERIFIED 优先于 PENDING_VERIFICATION（关键路径）', async () => {
+  // VERIFIED 是通往 HEALTHY 的唯一路径：一次成功就让节点变成可下发。
+  // 按超期倍数排的话它永远排不上 —— PENDING 超期 3 倍 vs VERIFIED 刚超期
+  // 1.07 倍，后者会被永久挤掉，于是 HEALTHY 恒为 0。
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  const pending = await mkEndpoint('PENDING_VERIFICATION', 30); // 超期 3 倍
+  const verified = await mkEndpoint('VERIFIED', 16); // 刚超期
+  const r = await enqueueDueProbes();
+  const ids = await jobEndpointIds(r.jobId!);
+  assert.ok(ids.includes(verified), 'VERIFIED 必须被探，否则 HEALTHY 永远是 0');
+  assert.ok(ids.indexOf(verified) < ids.indexOf(pending), '关键路径排在前');
   await clearSchedulerJobs();
 });
 
@@ -196,6 +214,20 @@ await check('复探不足时，余量让给首次探测', async () => {
     6,
     '没有复探可做时批次必须用满，不能只入一半',
   );
+  await clearSchedulerJobs();
+});
+
+await check('HEALTHY 有保底份额，不会被 VERIFIED 挤掉', async () => {
+  // 只按优先级排会让 HEALTHY 永远排在 VERIFIED/PENDING 后面，
+  // 那样订阅里会长期留着已经死掉的节点 —— 比不产出更糟。
+  // 份额保证任何一档都不会饿死，这是构造出来的，不是靠排序碰巧。
+  await settleAllEndpoints();
+  await clearSchedulerJobs();
+  for (let i = 0; i < 200; i += 1) await mkEndpoint('VERIFIED', 30);
+  const healthy = await mkEndpoint('HEALTHY', 400); // 超期 1.1 倍，只比刚到期的多一点点
+  const r = await enqueueDueProbes(40);
+  const ids = await jobEndpointIds(r.jobId!);
+  assert.ok(ids.includes(healthy), 'HEALTHY 必须分到配额，否则死节点会一直留在订阅里');
   await clearSchedulerJobs();
 });
 

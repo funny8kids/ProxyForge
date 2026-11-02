@@ -214,6 +214,38 @@ await check('已停用后再跑 → 不会重复写停用时间', async () => {
   );
 });
 
+console.log('\n[4b] 公开代理的正常存活率不该被停用');
+
+await check('存活 12%、质量 45 的源连续多轮不被停用', async () => {
+  // 这是公开代理列表的典型水平：thespeedx-http 实测存活 381/3196（12%）、
+  // 平均质量 45。按公式 0.55*45 + 0.45*wilsonLower(12,100)*100 ≈ 27.9 分。
+  //
+  // 旧阈值 30 下这种源会被判死 —— 实测启用 16 个内置源后，15 个在两轮
+  // 重算内被自动停用，其中 thespeedx-http 已经贡献了 3368 个候选。
+  // 把阈值调回 30 会让「多节点」的入口自己关上，所以这里钉住行为。
+  const normal = await mkSource({ key: 'normal-survival', trust: 40 });
+  await mkNodes(normal, { n: 100, alive: 12, quality: 45 });
+
+  for (let i = 0; i < 3; i += 1) await recomputeSourceQuality();
+
+  const row = await sourceRow(normal);
+  assert.equal(row.enabled, true, '正常存活率的公开源不该被自动停用');
+  assert.equal(row.auto_disabled_at, null);
+});
+
+await check('存活 0% 的源照样会被停用（阈值下调不是放水）', async () => {
+  // 反面断言：降到 20 之后，真的没救的源必须仍然被停掉。
+  // proxifly / hideipme-http 实测存活 0/200 和 0/33。
+  const dead = await mkSource({ key: 'dead-source', trust: 40 });
+  await mkNodes(dead, { n: 50, alive: 0, quality: 0 });
+
+  await recomputeSourceQuality();
+  await recomputeSourceQuality();
+
+  const row = await sourceRow(dead);
+  assert.equal(row.enabled, false, '零存活的源必须停用，否则白烧探测预算');
+});
+
 console.log('\n[5] AUTHORIZED 豁免');
 
 const authorized = await mkSource({ key: 'authorized-bad', auth: 'AUTHORIZED', trust: 80 });

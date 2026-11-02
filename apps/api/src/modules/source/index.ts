@@ -10,13 +10,14 @@ import { extractEntries } from '../../shared/extract.js';
 import { CATALOG } from '../../shared/sources-catalog.js';
 import { sha256Hex } from '../../shared/crypto.js';
 import { runDiscoveryTask } from '../ai/discovery.js';
+import { promoteCandidates } from './promote.js';
 
 /** 一批插入的候选行数。9 个参数 × 250 行 = 2250 个占位符，远低于 PG 的 65535 上限，
  *  同时把往返次数从「一行一次」压到「两百多行一次」—— PGlite 是单写者，
  *  逐条 INSERT 四万行会让整个 API 在同步期间完全失去响应。 */
 const INSERT_CHUNK = 250;
 
-interface SourceRow {
+export interface SourceRow {
   id: string;
   key: string;
   name: string;
@@ -27,7 +28,7 @@ interface SourceRow {
   config: Record<string, unknown> | null;
 }
 
-interface SyncOutcome {
+export interface SyncOutcome {
   sourceId: string;
   key: string;
   name: string;
@@ -340,10 +341,24 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
 
   /** 一键导入内置目录。幂等：按 key upsert，不覆盖用户改过的信任级与开关。 */
   app.post('/sources/catalog', { preHandler: guard('source:write') }, async (req) => {
-    const body = (req.body ?? {}) as { keys?: string[] };
+    const body = (req.body ?? {}) as {
+      keys?: string[];
+      /** 导入后由采集流水线自动把候选晋级成端点 */
+      autoPromote?: boolean;
+      /** 自动晋级时写入端点的授权状态。autoPromote 为 true 时必填。 */
+      authorization?: 'AUTHORIZED' | 'RESTRICTED';
+    };
     const actor = actorOf(req);
     const wanted = body.keys?.length ? CATALOG.filter((c) => body.keys!.includes(c.key)) : CATALOG;
     if (!wanted.length) throw invalid('目录里没有匹配的 key');
+
+    // 自动晋级必须配一个明确的授权声明。公开代理列表我们不知道每个 IP 的
+    // 归属，系统不替用户编一个 AUTHORIZED 出来 —— 只执行用户声明的结果。
+    const autoPromote = body.autoPromote === true;
+    const auth = body.authorization ?? null;
+    if (autoPromote && auth !== 'AUTHORIZED' && auth !== 'RESTRICTED') {
+      throw invalid('autoPromote 必须同时声明 authorization（AUTHORIZED 或 RESTRICTED）');
+    }
 
     let created = 0;
     let updated = 0;
@@ -352,34 +367,41 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
       for (const c of wanted) {
         const existing = await t.q1<{ id: string }>('SELECT id FROM resource_sources WHERE key = $1', [c.key]);
         if (existing) {
-          // 只刷新描述性字段；enabled / trust_level 是用户的决定，不覆盖
+          // 只刷新描述性字段；enabled / trust_level 是用户的决定，不覆盖。
+          // auto_promote 例外：它是本次请求显式表达的意图。
           await t.exec(
             `UPDATE resource_sources SET name = $2, url = $3, type = $4::source_type,
-               format_hint = $5, config = $6::jsonb, notes = $7, updated_at = now()
+               format_hint = $5, config = $6::jsonb, notes = $7,
+               auto_promote = CASE WHEN $8 THEN true ELSE auto_promote END,
+               auto_promote_authorization = CASE WHEN $8 THEN $9::authorization_status
+                                                 ELSE auto_promote_authorization END,
+               updated_at = now()
              WHERE id = $1`,
             [existing.id, c.name, c.url, c.type, c.formatHint,
-              JSON.stringify({ protocolHint: c.protocolHint }), c.notes],
+              JSON.stringify({ protocolHint: c.protocolHint }), c.notes, autoPromote, auth],
           );
           updated += 1;
         } else {
           await t.exec(
             `INSERT INTO resource_sources
                (id, key, name, type, url, format_hint, authorization_status, trust_level,
-                sync_interval_seconds, config, notes)
-             VALUES ($1,$2,$3,$4::source_type,$5,$6,'UNKNOWN',$7,$8,$9::jsonb,$10)`,
+                sync_interval_seconds, config, notes, auto_promote, auto_promote_authorization)
+             VALUES ($1,$2,$3,$4::source_type,$5,$6,'UNKNOWN',$7,$8,$9::jsonb,$10,$11,$12::authorization_status)`,
             [uuidv7(), c.key, c.name, c.type, c.url, c.formatHint, c.trustLevel,
-              c.syncIntervalSeconds, JSON.stringify({ protocolHint: c.protocolHint }), c.notes],
+              c.syncIntervalSeconds, JSON.stringify({ protocolHint: c.protocolHint }), c.notes,
+              autoPromote, auth],
           );
           created += 1;
         }
       }
       await audit(t, {
         actorType: actor.kind, actorId: actor.id, action: 'source.catalog',
-        resourceType: 'source', resourceId: null, afterState: { created, updated },
+        resourceType: 'source', resourceId: null,
+        afterState: { created, updated, autoPromote, authorization: auth },
       });
     });
 
-    return { created, updated, total: wanted.length };
+    return { created, updated, total: wanted.length, autoPromote, authorization: auth };
   });
 
 
@@ -505,74 +527,19 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
       throw invalid('必须显式声明 authorization（AUTHORIZED 或 RESTRICTED），批量晋级不接受默认值');
     }
     const limit = Math.min(Math.max(body.limit ?? 200, 1), 500);
+    // 收窄成局部常量：闭包里 TS 不会保留前面 throw 的收窄结果
+    const authorization = body.authorization;
 
     return tx(async (t) => {
-      const pending = await t.q<{
-        id: string; protocol: ProxyProtocol; host: string; port: number; dedupe_key: string | null;
-      }>(
-        `SELECT id, protocol, host, port, dedupe_key
-         FROM candidate_endpoints
-         WHERE source_id = $1 AND review_status = 'PENDING'
-           AND host IS NOT NULL AND port IS NOT NULL AND protocol IS NOT NULL
-         ORDER BY created_at ASC
-         LIMIT $2`,
-        [body.sourceId, limit],
-      );
-
-      if (!pending.length) return { promoted: 0, duplicate: 0, remaining: 0 };
-
-      // 已存在的端点先查一遍，避免逐条 SELECT
-      const keys = pending.map((c) => c.dedupe_key).filter((k): k is string => !!k);
-      const existing = keys.length
-        ? await t.q<{ dedupe_key: string }>('SELECT dedupe_key FROM proxy_endpoints WHERE dedupe_key = ANY($1::text[])', [keys])
-        : [];
-      const existingSet = new Set(existing.map((e) => e.dedupe_key));
-
-      let promoted = 0;
-      let duplicate = 0;
-
-      for (const c of pending) {
-        if (c.dedupe_key && existingSet.has(c.dedupe_key)) {
-          await t.exec(`UPDATE candidate_endpoints SET review_status = 'DUPLICATE', reviewed_at = now() WHERE id = $1`, [c.id]);
-          duplicate += 1;
-          continue;
-        }
-
-        const endpointId = uuidv7();
-        await t.exec(
-          `INSERT INTO proxy_endpoints
-             (id, source_id, protocol, host, port, origin_type, authorization_status, trust_tier,
-              lifecycle_status, dedupe_key, display_name)
-           VALUES ($1,$2,$3,$4,$5,'PUBLIC_PROXY',$6::authorization_status,'PUBLIC_PROXY',
-                   'PENDING_VERIFICATION',$7,$8)`,
-          [endpointId, body.sourceId, c.protocol, c.host, c.port, body.authorization, c.dedupe_key,
-            `${c.host}:${c.port}`],
-        );
-        await t.exec('INSERT INTO endpoint_health_state (endpoint_id) VALUES ($1) ON CONFLICT DO NOTHING', [endpointId]);
-        await t.exec(
-          `UPDATE candidate_endpoints SET review_status = 'PROMOTED', promoted_endpoint_id = $2,
-             reviewed_at = now(), reviewed_by = $3 WHERE id = $1`,
-          [c.id, endpointId, actor.id],
-        );
-        // 同批次里跨源重复的同一条代理，也要拦住 —— 否则两个源各推一次
-        // 就会在端点表里建出两行 dedupe_key 相同的记录（没有唯一约束兜底）。
-        if (c.dedupe_key) existingSet.add(c.dedupe_key);
-        promoted += 1;
-      }
-
-      const rest = await t.q1<{ n: number }>(
-        `SELECT count(*)::int AS n FROM candidate_endpoints
-         WHERE source_id = $1 AND review_status = 'PENDING'`,
-        [body.sourceId],
-      );
-
+      // 晋级逻辑与自动采集流水线共用一份实现（source/promote.ts）——
+      // 两处各写一份 SQL 迟早会分叉成「手工晋级写了 provenance、自动晋级没写」。
+      const result = await promoteCandidates(t, body.sourceId!, authorization, limit);
       await audit(t, {
         actorType: actor.kind, actorId: actor.id, action: 'candidate.bulk_promote',
-        resourceType: 'source', resourceId: body.sourceId,
-        afterState: { promoted, duplicate, remaining: rest?.n ?? 0, authorization: body.authorization },
+        resourceType: 'source', resourceId: body.sourceId!,
+        afterState: { ...result, authorization },
       });
-
-      return { promoted, duplicate, remaining: rest?.n ?? 0 };
+      return result;
     });
   });
 
@@ -663,7 +630,7 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
  * 任何一步失败都返回结构化结果而不是抛异常 —— 批量同步时
  * 一个源挂了不能让其余 16 个源的结果全部丢失。
  */
-async function syncSource(
+export async function syncSource(
   source: SourceRow,
   actor: { kind: 'USER' | 'API_KEY' | 'SYSTEM' | 'SCHEDULER'; id: string },
   opts: { content?: string; authorization?: string } = {},

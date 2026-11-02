@@ -242,6 +242,58 @@ export async function registerResourceRoutes(app: FastifyInstance): Promise<void
   });
 
   // ── 批量导入 ──
+  /**
+   * 清理合成端点。
+   *
+   * 种子数据用的是 RFC 5737 / RFC 5735 文档保留地址（192.0.2.0/24、
+   * 198.51.100.0/24、203.0.113.0/24、198.18.0.0/15）。这些段被标准明确
+   * 规定为**不可路由**，任何使用它们的端点必然是演示数据，不可能是真实代理。
+   *
+   * 为什么必须清掉：切到真实探测之后，这些端点会陆续被判死，但在被判死之前
+   * 它们仍然挂着 HEALTHY，会进入实验池、出现在 Clash 订阅里 ——
+   * 用户导入后发现一半节点连不上，而原因是一堆 RFC 文档地址。
+   * 按地址段清理是精确的：不需要靠名字或标签猜测哪个是假数据。
+   *
+   * 默认 dryRun，必须先看数量再决定。软删除（deleted_at），不物理删除 ——
+   * 池重算会自动把它们移出成员，审计链也还在。
+   */
+  app.post('/resources/purge-synthetic', { preHandler: guard('resource:write') }, async (req) => {
+    const body = (req.body ?? {}) as { dryRun?: boolean };
+    const actor = actorOf(req);
+    const filter = `
+      e.host ~ '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'
+      AND (
+        e.host::inet <<= '192.0.2.0/24'::cidr
+        OR e.host::inet <<= '198.51.100.0/24'::cidr
+        OR e.host::inet <<= '203.0.113.0/24'::cidr
+        OR e.host::inet <<= '198.18.0.0/15'::cidr
+      )`;
+
+    const counted = await q1<{ c: string }>(
+      `SELECT count(*)::text AS c FROM proxy_endpoints e
+       WHERE e.deleted_at IS NULL AND ${filter}`,
+    );
+    const candidates = Number(counted?.c ?? 0);
+
+    if (body.dryRun !== false || candidates === 0) {
+      return { candidates, deleted: 0, dryRun: true };
+    }
+
+    const deleted = await tx(async (t) => {
+      const n = await t.exec(
+        `UPDATE proxy_endpoints e SET deleted_at = now(), updated_at = now()
+         WHERE e.deleted_at IS NULL AND ${filter}`,
+      );
+      await audit(t, {
+        actorType: actor.kind, actorId: actor.id, action: 'resource.purge_synthetic',
+        resourceType: 'endpoint', resourceId: null, afterState: { deleted: n },
+      });
+      return n;
+    });
+
+    return { candidates, deleted, dryRun: false };
+  });
+
   app.post('/resources/import', { preHandler: guard('resource:write') }, async (req): Promise<ImportResult> => {
     const body = req.body as {
       mode?: string;

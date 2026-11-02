@@ -6,7 +6,7 @@ import { recomputePool } from '../modules/pool/index.js';
 import { applyPolicies, defaultInstanceId } from '../modules/policy/index.js';
 import { runVerificationJob } from '../modules/verification/index.js';
 import { backfillExitGeography } from '../modules/verification/geo.js';
-import { enqueueDueProbes, pruneFinishedJobs, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
+import { ACTIVE_JOB_PREDICATE, enqueueDueProbes, pruneFinishedJobs, pruneSchedulerJobs, reclaimAllRunning, reclaimStaleJobs } from '../modules/verification/schedule.js';
 import { runDiscoveryTask } from '../modules/ai/discovery.js';
 import { applyRuntime } from '../modules/gateway/runtime.js';
 import { CONSUMERS, type Consumer } from '../modules/events/consumers.js';
@@ -366,7 +366,7 @@ async function periodic(): Promise<void> {
       const running = await q1<{ id: string; age: string }>(
         `SELECT id, EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at)))::int::text AS age
          FROM verification_jobs
-         WHERE status IN ('PENDING','RUNNING') AND filter = '{"source":"scheduler"}'::jsonb
+         WHERE ${ACTIVE_JOB_PREDICATE} AND filter = '{"source":"scheduler"}'::jsonb
          LIMIT 1`,
       );
       if (running && running.id !== busyProbeJob) {

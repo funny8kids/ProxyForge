@@ -136,6 +136,74 @@ await check('到期统计与入队判定一致', async () => {
   await clearSchedulerJobs();
 });
 
+console.log('\n[1c] 僵尸任务不能锁死探测');
+
+/**
+ * 造一个"半死不活"的调度任务。
+ *
+ * `ageMin` 控制 started_at 距今多久 —— 这是区分"正常在跑"和"上一个进程
+ * 被强杀留下的残骸"的唯一依据。
+ */
+async function mkStuckJob(status: 'PENDING' | 'RUNNING', ageMin: number): Promise<string> {
+  const row = await q1<{ id: string }>(
+    `INSERT INTO verification_jobs (scope, endpoint_ids, status, total, priority, filter, started_at)
+     VALUES ('ENDPOINTS', ARRAY[]::uuid[], $1, 1, 50, '{"source":"scheduler"}'::jsonb,
+             now() - ($2 || ' minutes')::interval)
+     RETURNING id`,
+    [status, String(ageMin)],
+  );
+  return row!.id;
+}
+
+await check('PENDING 但已超窗的僵尸任务不再挡住入队', async () => {
+  // 真实事故：进程在探测途中被强杀，任务停在 PENDING、started_at 已写。
+  // 回收只扫 RUNNING，闸门却看 PENDING+RUNNING —— 两套条件分叉的结果是
+  // 这个任务永远不会被回收，也永远挡着入队，分级探测静默停摆。
+  await mkEndpoint('PENDING_VERIFICATION', null);
+  const zombie = await mkStuckJob('PENDING', 30);
+
+  const r = await enqueueDueProbes();
+  assert.equal(r.reason, undefined, `僵尸任务 ${zombie.slice(0, 8)} 不该让入队返回 ${r.reason}`);
+  assert.ok(r.jobId, '僵尸任务超窗后必须放行新任务');
+
+  const after = await q1<{ status: string }>('SELECT status FROM verification_jobs WHERE id = $1', [zombie]);
+  assert.equal(after?.status, 'FAILED', '超窗任务必须被标 FAILED，而不是留在 PENDING 里反复失败');
+  await clearSchedulerJobs();
+});
+
+await check('刚启动的正常任务仍然挡住入队', async () => {
+  // 反面断言：闸门不能因为上面那条修复就形同虚设。慢探测期间每 15 秒堆一个
+  // 任务会让同一端点被并发探多次，health_checks 里全是重复样本。
+  await mkEndpoint('PENDING_VERIFICATION', null);
+  const fresh = await mkStuckJob('RUNNING', 0);
+
+  const r = await enqueueDueProbes();
+  assert.equal(r.reason, 'busy', '刚认领的任务必须挡住入队');
+  assert.equal(r.picked, 0);
+
+  await exec(`UPDATE verification_jobs SET status='SUCCEEDED', finished_at=now() WHERE id=$1`, [fresh]);
+  await clearSchedulerJobs();
+});
+
+await check('重启时 RUNNING 任务被重置且清空 started_at', async () => {
+  // 只改 status 不清 started_at，会留下"PENDING 但带着旧 started_at"的行，
+  // 而 ACTIVE_JOB_PREDICATE 会把 10 分钟内的这种行当成仍在运行 ——
+  // 于是重启后照样要干等 10 分钟，正是这个函数存在的理由。
+  const job = await mkStuckJob('RUNNING', 0);
+  const { reclaimAllRunning } = await import('../apps/api/src/modules/verification/schedule.js');
+  await reclaimAllRunning();
+
+  const row = await q1<{ status: string; started_at: string | null }>(
+    'SELECT status, started_at FROM verification_jobs WHERE id = $1',
+    [job],
+  );
+  assert.equal(row?.status, 'PENDING');
+  assert.equal(row?.started_at, null, 'started_at 必须清空，否则 claimJobs 认领后仍被当成超窗任务');
+
+  await exec(`UPDATE verification_jobs SET status='SUCCEEDED', finished_at=now() WHERE id=$1`, [job]);
+  await clearSchedulerJobs();
+});
+
 console.log('\n[2] 到期入队');
 await check('HEALTHY 超过 6 小时 → 入队', async () => {
   const id = await mkEndpoint('HEALTHY', 400);

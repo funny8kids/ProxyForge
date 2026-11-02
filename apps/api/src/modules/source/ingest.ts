@@ -49,18 +49,28 @@ const TARGET_HEALTHY = Number(process.env.PF_INGEST_TARGET_HEALTHY ?? 400);
 const PROMOTE_BUDGET = Number(process.env.PF_INGEST_PROMOTE_BUDGET ?? 1500);
 
 /**
- * 在途待探测端点上限 —— 晋级必须被探测吞吐量约束住。
+ * 在途待探测端点上限 —— 晋级必须被探测消化速率约束住。
  *
  * 不加这个闸门时实测：晋级 1500/轮（15 秒一轮，即 6000/分），
- * 而探测只有 60/轮（240/分），比例 25:1。结果是库里几分钟堆出几万个
+ * 而探测只有 120/轮（约 480/分），比例 12:1。结果是库里几分钟堆出几万个
  * 从没探过的端点行，探测队列永远追不上，而"健康数是否达标"的判断
  * 依据的是 HEALTHY 数量 —— 新晋级的全是 PENDING_VERIFICATION，
  * 一个都不计入，于是闸门永远不会关上。
  *
- * 400 是按探测吞吐定的：一轮 60 个、15 秒一轮 ≈ 240/分，
- * 400 相当于不到 2 分钟的缓冲，既不会让探测饿着，也不会让库无谓膨胀。
+ * ## 这个数字怎么定
+ *
+ * 它限制的是"尚未定论的节点总数"（见 `countAwaitingProbe` 的注释），
+ * 而一个失败节点从进队到被判死要经历两次探测、间隔 30 分钟，也就是
+ * 每个失败节点要占住一个名额约 30 分钟。于是：
+ *
+ *     稳定晋级速率 ≈ 上限 / 30 分钟
+ *
+ * 上限 400 时只有 13 个/分，按 15% 存活率折算约 2 个健康节点/分 ——
+ * 从 580 涨到 1500 要七个多小时。上限 1200 时约 40 个/分，
+ * 折算 6 个健康节点/分，两小时出头能到目标，而库里同时最多
+ * 只有 1200 行待定节点，不会无谓膨胀。
  */
-const PROBE_BACKLOG_MAX = Number(process.env.PF_INGEST_PROBE_BACKLOG ?? 400);
+const PROBE_BACKLOG_MAX = Number(process.env.PF_INGEST_PROBE_BACKLOG ?? 1200);
 
 /** 过期标记的扫描间隔。清理语义，早一小时晚一小时没有影响。 */
 const STALE_SWEEP_MS = 60 * 60 * 1000;
@@ -132,26 +142,35 @@ async function countHealthyPublic(): Promise<number> {
 }
 
 /**
- * 还没做过**第一次**探测的端点数。
+ * 还没出结论的端点数 —— 也就是"探测队列里真实积压的量"。
  *
- * 口径刻意只算 `last_check_at IS NULL`，不是"生命周期还在 PENDING_VERIFICATION"。
- * 后者包含已经探过 1–2 次失败、正在等 10 分钟后复探的端点 ——
- * 把它们算进来会让闸门在晋级之后一直关着：400 个端点探完第一轮后
- * 生命周期仍是 PENDING_VERIFICATION，要等 3 次失败（≈20 分钟）才会离开，
- * 于是下一批 400 个得干等 20 分钟才能晋级。
+ * ## 为什么必须把"已探过一次但还没判死"的也算进来
  *
- * 复探是调度器自己的节奏，不该阻塞新候选进场；
- * 这里要限的是"一次性丢给探针多少从没见过的东西"。
+ * 这里曾经只算 `hs.last_check_at IS NULL`（从没探过的）。当时的理由是
+ * "复探是调度器自己的节奏，不该阻塞新候选进场"。这个理由在
+ * `PF_INGEST_TARGET_HEALTHY=400` 时看不出问题 —— 因为健康数常年高于目标，
+ * 晋级闸门本来就关着，一行都不会晋级。
+ *
+ * 把目标提到 1500 之后立刻暴露：探测一次失败的端点仍留在
+ * `PENDING_VERIFICATION`（要连续 2 次失败才判死，而两次之间隔 30 分钟），
+ * 但它已经不在 `last_check_at IS NULL` 里了，于是闸门认为"队列空了"，
+ * 立刻再放 120 个进来。实测 6 分钟内 PENDING 从 1168 涨到 3090，
+ * 而 HEALTHY 一个没动 —— 只进不出。
+ *
+ * 均衡点会落在「PENDING 复探周期 × 晋级速率」≈ 两万条，届时 PENDING 档
+ * 15% 的探测配额要服务两万个节点，VERIFIED（通往 HEALTHY 的唯一关键路径）
+ * 会被彻底饿死，健康数再也涨不上去。
+ *
+ * 所以口径改成"所有尚未定论的公开代理"，让闸门限的是**真实积压**，
+ * 而不是"还没被碰过的东西"。这样晋级速率被探测消化速率天然约束住。
  */
 async function countAwaitingProbe(): Promise<number> {
   const row = await q<{ c: string }>(
     `SELECT count(*)::text AS c
      FROM proxy_endpoints e
-     LEFT JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
      WHERE e.deleted_at IS NULL
        AND e.trust_tier = 'PUBLIC_PROXY'
-       AND e.lifecycle_status IN ('DISCOVERED', 'PENDING_VERIFICATION')
-       AND hs.last_check_at IS NULL`,
+       AND e.lifecycle_status IN ('DISCOVERED', 'PENDING_VERIFICATION')`,
   );
   return Number(row[0]?.c ?? 0);
 }

@@ -172,26 +172,58 @@ const FRESH_SHARE = 0.5;
 const OVERDUE_RATIO = `EXTRACT(EPOCH FROM (now() - hs.last_check_at)) / (t.minutes * 60)`;
 
 /**
+ * 僵死任务的判定窗口。
+ *
+ * 一次调度任务的正常时长在 10–20 秒量级（120 个端点 / 48 并发 × 4 秒超时），
+ * 10 分钟已是 30 倍余量。
+ *
+ * **这个窗口必须同时用于「回收」和「是否在跑」两处。** 见 reclaimStaleJobs。
+ */
+const STALE_JOB_MINUTES = 10;
+
+/**
+ * 「这个任务还活着」的唯一判定。
+ *
+ * 回收（reclaimStaleJobs）、入队闸门（enqueueDueProbes）、日志（worker/main）
+ * 三处必须共用它。曾经回收只看 `status='RUNNING'`，而闸门看
+ * `status IN ('PENDING','RUNNING')` —— 两套条件分叉的直接后果：
+ * 一个被强杀在 PENDING 的调度任务（`started_at` 已写、`finished_at` 为空）
+ * 永远不会被回收，也永远挡着入队，**分级探测静默停摆，日志里只有
+ * 每 15 秒一行「探测暂停」**，而库里所有端点再也没被探过一次。
+ *
+ * 实测就是这么停的：任务 46506903 停在 PENDING、completed 25/120，
+ * 之后 8 分钟里 healthy / pending / total 三个数字一个都没动。
+ */
+export const ACTIVE_JOB_PREDICATE = `status IN ('PENDING','RUNNING')
+       AND (started_at IS NULL OR started_at > now() - interval '${STALE_JOB_MINUTES} minutes')`;
+
+/**
  * 回收僵死任务。
  *
  * 认领时会写 `lease_expires_at`，但进程被强杀之后没有任何东西会去清它 ——
- * 那个任务就永远停在 RUNNING，既不会被重试，也会让调度器认为
- * "已有任务在跑"从而再也不入队。表现出来就是分级探测静默停摆：
- * 没有报错、没有日志，只是什么都不再发生。
+ * 那个任务就永远停在 RUNNING（或者停在 PENDING 但带着 started_at），
+ * 既不会被重试，也会让调度器认为"已有任务在跑"从而再也不入队。
+ * 表现出来就是分级探测静默停摆：没有报错、没有日志，只是什么都不再发生。
  *
- * 回收和"是否在跑"必须是**同一套判断**。这两处一旦各写一份条件，
- * 迟早会分叉成"回收了但仍在跑"或者"没回收却认为在跑"。
+ * 回收和"是否在跑"必须是**同一套判断**（共用 ACTIVE_JOB_PREDICATE）。
+ * 这两处一旦各写一份条件，迟早会分叉成"回收了但仍在跑"或者
+ * "没回收却认为在跑"。
+ *
+ * 超窗的任务直接标 FAILED 而不是退回 PENDING：它能挂这么久说明是
+ * 进程被强杀留下的残骸，退回 PENDING 只会让它在下一个 tick 里
+ * 再死一次，而 attempts 每次 +1，最后卡在 `attempts >= max_attempts`
+ * 的 PENDING 上 —— 那是比 RUNNING 更难发现的死锁。
  */
 export async function reclaimStaleJobs(): Promise<number> {
   return exec(
     `UPDATE verification_jobs
-     SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL
-     WHERE status = 'RUNNING'
-       AND (
-         (lease_expires_at IS NOT NULL AND lease_expires_at < now())
-         -- 升级前认领的老行没有租约时间，只能按开始时间兜底
-         OR (lease_expires_at IS NULL AND started_at < now() - interval '10 minutes')
-       )`,
+     SET status = 'FAILED',
+         lease_owner = NULL,
+         lease_expires_at = NULL,
+         finished_at = now()
+     WHERE status IN ('PENDING','RUNNING')
+       AND started_at IS NOT NULL
+       AND started_at < now() - interval '${STALE_JOB_MINUTES} minutes'`,
   );
 }
 
@@ -204,7 +236,7 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
   // 同一个端点被并发探多次，health_checks 里全是重复样本，24h 聚合被稀释。
   const busy = await q<{ id: string }>(
     `SELECT id FROM verification_jobs
-     WHERE status IN ('PENDING','RUNNING') AND filter = ${SCHEDULER_MARK}
+     WHERE ${ACTIVE_JOB_PREDICATE} AND filter = ${SCHEDULER_MARK}
      LIMIT 1`,
   );
   if (busy.length > 0) return { jobId: null, picked: 0, reason: 'busy' };
@@ -307,11 +339,17 @@ export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueRe
  * 进程重启后到租约过期之间，调度器的 busy 守卫会认为"有任务在跑"
  * 从而一直不入队。表现出来就是**重启后探测静默停摆几分钟**，
  * 日志里只有一行 busy，没有任何错误。这个坑在开发中已经踩过两次。
+ *
+ * `started_at` 也必须清空 —— 只改 status 会留下一个
+ * "PENDING 但带着旧 started_at"的行，而 `ACTIVE_JOB_PREDICATE` 会把
+ * 10 分钟内的这种行当成仍在运行，于是重启后照样要干等 10 分钟。
+ * 清空之后 `claimJobs` 会在 500ms 内重新认领并把它跑完，这才是
+ * "重启后立刻恢复"该有的行为。
  */
 export async function reclaimAllRunning(): Promise<number> {
   return exec(
     `UPDATE verification_jobs
-     SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL
+     SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL, started_at = NULL
      WHERE status = 'RUNNING'`,
   );
 }

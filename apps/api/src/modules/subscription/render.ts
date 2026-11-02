@@ -299,6 +299,34 @@ function proxyEntries(proxies: ExportProxy[]): string[] {
   return lines;
 }
 
+/**
+ * 健康检查目标。
+ *
+ * 必须是 https，不能是 http —— 这里踩过一次真实的坑：
+ * 探针判定 `connect_ok = false` 的节点（能转发明文 HTTP、但建不起
+ * CONNECT 隧道）用 `http://` 探测照样返回 204，于是被 url-test 判为
+ * 健康并选中；用户打开任何 https 站点立刻失败，而客户端界面还显示
+ * "已连接、延迟 80ms"。
+ *
+ * 判据必须和「能用」的定义一致：一个节点算健康，前提是它能把 TLS
+ * 流量转发出去。代价是纯明文代理会全部测红 —— 但那类节点对现代网站
+ * 本来就没有使用价值，测红是如实反映，不是误判。
+ */
+const HEALTH_CHECK_URL = 'https://www.gstatic.com/generate_204';
+
+/**
+ * 健康检查间隔（秒）。
+ *
+ * 公开代理池里的节点存活期常常只有几分钟，间隔太长会让「当前节点已死」
+ * 这件事迟迟反映不到组状态上。压到 180s 是兜底：即使没有任何连接失败
+ * 事件，组状态也至少 3 分钟刷新一次。
+ *
+ * 注意不要把它当成切换延迟 —— 配合下面的 lazy 时，当前节点一旦连接失败
+ * 就会立刻触发重新选路，不必等满一个周期。这里的时间只决定
+ * 「状态最迟多久变陈旧」。
+ */
+const HEALTH_CHECK_INTERVAL = 180;
+
 export function renderMihomo(
   poolKey: string,
   proxies: ExportProxy[],
@@ -367,8 +395,8 @@ export function renderMihomo(
   lines.push('proxy-groups:');
   lines.push(`  - name: ${yamlScalar(poolKey)}`);
   lines.push('    type: url-test');
-  lines.push('    url: http://www.gstatic.com/generate_204');
-  lines.push('    interval: 300');
+  lines.push(`    url: ${HEALTH_CHECK_URL}`);
+  lines.push(`    interval: ${HEALTH_CHECK_INTERVAL}`);
   // lazy：只有真正被选中的成员才测。池里几十个节点时，
   // 全量 url-test 会让客户端启动阶段连发几十个请求。
   lines.push('    lazy: true');
@@ -420,8 +448,8 @@ export function renderMihomoProvider(
   lines.push(`#       path: ./providers/${providerKey}.yaml`);
   lines.push('#       health-check:');
   lines.push('#         enable: true');
-  lines.push('#         url: http://www.gstatic.com/generate_204');
-  lines.push('#         interval: 300');
+  lines.push(`#         url: ${HEALTH_CHECK_URL}`);
+  lines.push(`#         interval: ${HEALTH_CHECK_INTERVAL}`);
   lines.push('#');
   lines.push(`# 然后在 proxy-groups 里用 "use: [${providerKey}]" 引用它。`);
   lines.push('#');
@@ -573,13 +601,31 @@ export function renderSingBox(
 
   const outbounds: Record<string, unknown>[] = proxies.map((p, i) => singboxOutbound(p, tags[i]!));
 
-  // selector 不能为空数组，否则 sing-box 启动直接报错。
+  // 自动选择组 + 手动选择组，两层。
+  //
+  // 只给 selector 是不够的：几百个节点让用户逐个手点，等于没做选择功能。
+  // 只给 urltest 也不行：节点全被自动接管，用户想固定某个出口时无处可设。
+  // 两层套起来的语义是「默认自动选优，需要时可手动锁定」——
+  // route.final 指向 selector，而 selector 默认指向 urltest。
+  //
+  // selector 的 outbounds 不能为空数组，否则 sing-box 启动直接报错，
+  // 所以这一整块只在 hasProxy 时生成。
   if (hasProxy) {
+    const autoTag = `${poolKey}-auto`;
+    outbounds.push({
+      type: 'urltest',
+      tag: autoTag,
+      outbounds: tags,
+      // 与 mihomo 侧同一个判据：能转发 TLS 才算健康。
+      url: HEALTH_CHECK_URL,
+      interval: `${HEALTH_CHECK_INTERVAL}s`,
+      tolerance: 50,
+    });
     outbounds.push({
       type: 'selector',
       tag: poolKey,
-      outbounds: tags,
-      default: tags[0],
+      outbounds: [autoTag, ...tags],
+      default: autoTag,
     });
   }
   outbounds.push({ type: 'direct', tag: 'direct' });

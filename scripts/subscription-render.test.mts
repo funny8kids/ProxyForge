@@ -335,5 +335,71 @@ check('命名模板支持 {country}，未知国家退化成 ??', () => {
   assert.deepEqual(named.map((p) => p.name), ['pf-JP-01', 'pf-??-02']);
 });
 
+console.log('\n[9] 健康检查口径：必须是能转发 TLS 才算健康');
+
+// 这一节钉的是一个曾经真实发生过的故障：探针判定 connect_ok=false 的节点
+// （能转发明文 HTTP、但建不起 CONNECT 隧道）用 http:// 探测照样返回 204，
+// 被 url-test 判为健康并选中，用户打开任何 https 站点直接失败，
+// 而客户端界面显示"已连接、延迟 80ms"。
+// 口径一旦退回 http://，症状就是「显示正常但上不了网」。
+
+check('mihomo 的 url-test 用 https 探测，不用 http', () => {
+  const yaml = renderMihomo('pool-a', PROXIES, 'now');
+  assert.ok(yaml.includes('    type: url-test'));
+  assert.ok(
+    yaml.includes('    url: https://www.gstatic.com/generate_204'),
+    '探测地址必须是 https —— http:// 会让只能明文转发的节点伪装成健康',
+  );
+  assert.ok(!yaml.includes('url: http://www.gstatic.com'), '不能残留 http 探测地址');
+});
+
+check('mihomo 的健康检查间隔收紧到 3 分钟内（免费代理存活期很短）', () => {
+  const yaml = renderMihomo('pool-a', PROXIES, 'now');
+  const m = /^ {4}interval: (\d+)$/m.exec(yaml);
+  assert.ok(m, 'url-test 必须带 interval');
+  const secs = Number(m[1]);
+  assert.ok(secs <= 180, `间隔 ${secs}s 太长，节点死后要等这么久才切换`);
+  assert.ok(secs >= 60, `间隔 ${secs}s 太短，健康检查本身会成为负担`);
+});
+
+check('provider 片段里的用法示例与整份配置口径一致', () => {
+  const yaml = renderMihomoProvider('pool-a', PROXIES, 'now');
+  // 注释里写 http:// 会把人带进同一个坑：照抄示例，得到一份测不出问题的配置
+  assert.ok(yaml.includes('#         url: https://www.gstatic.com/generate_204'));
+  assert.ok(!yaml.includes('url: http://www.gstatic.com'));
+});
+
+check('sing-box 生成 urltest 自动选优组，而不是裸 selector', () => {
+  const cfg = JSON.parse(renderSingBox('pool-a', PROXIES, 'now', 'rule'));
+  const auto = cfg.outbounds.find((o: { type: string }) => o.type === 'urltest');
+  assert.ok(auto, '必须有 urltest 组：几百个节点让用户逐个手点等于没有选择功能');
+  assert.equal(auto.url, 'https://www.gstatic.com/generate_204');
+  assert.ok(Array.isArray(auto.outbounds) && auto.outbounds.length === PROXIES.length);
+  // 每个成员都必须是真实存在的节点 tag，否则 sing-box 启动即报错
+  const tags = new Set(cfg.outbounds.map((o: { tag: string }) => o.tag));
+  for (const t of auto.outbounds) assert.ok(tags.has(t), `urltest 引用了不存在的节点：${t}`);
+});
+
+check('sing-box 的 selector 默认指向 urltest，同时保留手动锁定', () => {
+  const cfg = JSON.parse(renderSingBox('pool-a', PROXIES, 'now', 'rule'));
+  const sel = cfg.outbounds.find((o: { tag: string }) => o.tag === 'pool-a');
+  const auto = cfg.outbounds.find((o: { type: string }) => o.type === 'urltest');
+  assert.equal(sel.type, 'selector');
+  assert.equal(sel.default, auto.tag, '默认必须是自动选优');
+  assert.equal(sel.outbounds[0], auto.tag, '自动组要排在第一位');
+  // 自动组之外还要能选到每一个具体节点
+  assert.equal(sel.outbounds.length, PROXIES.length + 1);
+  // route.final 指向 selector，selector 再落到 urltest —— 链路不能断
+  assertOutboundsExist(cfg);
+  assert.equal(cfg.route.final, 'pool-a');
+});
+
+check('空池不生成 urltest / selector（空成员数组会让 sing-box 启动失败）', () => {
+  const cfg = JSON.parse(renderSingBox('pool-a', [], 'now', 'rule'));
+  assert.equal(cfg.outbounds.filter((o: { type: string }) => o.type === 'urltest').length, 0);
+  assert.equal(cfg.outbounds.filter((o: { type: string }) => o.type === 'selector').length, 0);
+  assert.equal(cfg.route.final, 'direct');
+});
+
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);
 process.exit(fail === 0 ? 0 : 1);

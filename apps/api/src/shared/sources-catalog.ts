@@ -197,6 +197,12 @@ export const CATALOG: CatalogEntry[] = [
   //     **条目数不等于价值**，这两支是反例：10 万条里 24 条抽样没有一个能转发
   //   · vakhov-socks5(4.8%) / mmpx12-http(4.2%) —— 有产出但太低，加进来只会摊薄探测预算
   //   · proxylist.download / openproxy.space —— 502/521，源站已挂
+  //
+  // 一条后话：proxylistto-socks5 加进来之后跑了全量探测，0/107 存活，
+  // 与抽样的 5/24 完全相反。抽样 24 条时"有 1 个能建隧道"和"一个都没有"
+  // 只差一次投硬币 —— 24 条样本对 4% 这种量级的比例没有任何分辨力。
+  // 结论：小样本只够用来**排除明显无效的源**（0/24 就别要了），
+  // 不足以确认一个源可用；确认必须靠全量。这个源已停用。
   {
     key: 'iplocate-socks5',
     name: 'iplocate · SOCKS5',
@@ -217,7 +223,9 @@ export const CATALOG: CatalogEntry[] = [
     protocolHint: 'SOCKS5',
     trustLevel: 38,
     syncIntervalSeconds: 3600,
-    notes: '24 条抽样：存活 5（21%）、能建隧道 1（4.2%）；195 条，体量小但存活率不差',
+    notes:
+      '⚠ 全量探测 0/107 存活，已停用。24 条抽样曾测到 5 活 1 隧道（4.2%），' +
+      '是抽样运气 —— 这也是"小样本别下结论"的实例。保留条目以便日后复查',
   },
 
   // ── API 型 ──

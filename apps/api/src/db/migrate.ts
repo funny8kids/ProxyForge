@@ -18,8 +18,10 @@ export async function migrate(verbose = true): Promise<{ applied: string[]; skip
     );
   `);
 
-  const done = new Set(
-    (await q<{ name: string }>('SELECT name FROM schema_migrations')).map((r) => r.name),
+  const done = new Map(
+    (await q<{ name: string; checksum: string }>('SELECT name, checksum FROM schema_migrations')).map(
+      (r) => [r.name, r.checksum] as const,
+    ),
   );
 
   const applied: string[] = [];
@@ -27,6 +29,30 @@ export async function migrate(verbose = true): Promise<{ applied: string[]; skip
 
   for (const file of loadMigrationFiles()) {
     if (done.has(file.name)) {
+      /**
+       * 已应用的文件被改过 —— 必须喊出来。
+       *
+       * 记录的是 `sql.length` 而不是真哈希（历史原因），所以它只能发现
+       * "长度变了"这一种情况，但那一已经够用了：开发模式下保存 .sql 会
+       * 触发 `tsx watch` 热重启，而重启会跑迁移。文件写到一半就被应用、
+       * 记进 schema_migrations，之后补齐的内容永远不会生效 ——
+       * 而且没有任何报错。
+       *
+       * 实际踩过：0016 在"只写了 ALTER + INDEX、还没写视图"的中间状态
+       * 被应用（记录 800 字符）。补上视图之后列存在、视图却是旧的，
+       * 订阅接口报 `column v.connect_ok does not exist`，排查了半天。
+       *
+       * 只告警不抛错：抛错会让开发环境彻底起不来，而正确的修法是
+       * 新建一个迁移版本号，不是阻止启动。
+       */
+      const recorded = done.get(file.name);
+      const current = String(file.sql.length);
+      if (recorded !== current) {
+        console.warn(
+          `  ! ${file.name} 已应用，但文件内容与记录不符（记录 ${recorded} 字符，当前 ${current} 字符）。` +
+            '迁移是只进不退的 —— 改动请新建一个迁移文件，否则改动不会生效。',
+        );
+      }
       skipped.push(file.name);
       continue;
     }

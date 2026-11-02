@@ -117,12 +117,20 @@ export async function recomputePool(poolId: string, actorId?: string): Promise<{
       }
     }
 
-    // 容量上限：按质量分保留最优
+    // 容量上限：按"能否开隧道"优先，其次质量分。
+    //
+    // 只按 quality_score 排会让一批只能转发明文 HTTP 的节点占住名额 ——
+    // 实测存活节点里 60% 是这种，它们在 Clash 里对 HTTPS 站点完全不可用，
+    // 却因为明文 HTTP 探测成功而拿到不低的质量分。把 connect_ok 提到第一
+    // 排序键之后，同样 300 个名额里能上 HTTPS 的节点会优先入选。
+    //
+    // NULLS LAST：`connect_ok` 为 NULL 表示"还没测过"。这种节点不该因为
+    // "未知"就排到"明确支持"前面，但也不该直接丢掉 —— 放在最后等它被测。
     let entries = [...selected.entries()];
     if (pool.max_members !== null && entries.length > pool.max_members) {
       const scored = await t.q<{ id: string; quality_score: string }>(
         `SELECT endpoint_id AS id, quality_score FROM endpoint_health_state WHERE endpoint_id = ANY($1::uuid[])
-         ORDER BY quality_score DESC`,
+         ORDER BY connect_ok DESC NULLS LAST, quality_score DESC`,
         [entries.map(([id]) => id)],
       );
       const keep = new Set(scored.slice(0, pool.max_members).map((r) => r.id));
@@ -425,11 +433,12 @@ export async function registerPoolRoutes(app: FastifyInstance): Promise<void> {
     const { id } = req.params as { id: string };
     const rows = await q<Record<string, unknown>>(
       `SELECT m.endpoint_id, e.display_name, e.host, e.port, e.protocol, e.trust_tier,
-              m.source, m.weight, m.suppressed, m.suppress_reason, s.quality_score, e.lifecycle_status
+              m.source, m.weight, m.suppressed, m.suppress_reason, s.quality_score, e.lifecycle_status,
+              s.connect_ok
        FROM resource_pool_members m
        JOIN proxy_endpoints e ON e.id = m.endpoint_id
        LEFT JOIN endpoint_health_state s ON s.endpoint_id = e.id
-       WHERE m.pool_id = $1 ORDER BY s.quality_score DESC NULLS LAST`,
+       WHERE m.pool_id = $1 ORDER BY s.connect_ok DESC NULLS LAST, s.quality_score DESC NULLS LAST`,
       [id],
     );
     return { items: rows };

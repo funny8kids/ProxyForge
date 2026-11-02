@@ -37,21 +37,21 @@ function fixtureProbe(seed: string): ProbeResult {
     return {
       success: false, failedLayer: 1, failureReason: 'DNS_FAILURE',
       dnsMs: null, tcpMs: null, handshakeMs: null, totalMs: 12,
-      exitIp: null, exitCountry: null, errorDetail: 'fixture: dns failure',
+      exitIp: null, exitCountry: null, connectOk: null, errorDetail: 'fixture: dns failure',
     };
   }
   if (roll < 12) {
     return {
       success: false, failedLayer: 2, failureReason: 'TCP_TIMEOUT',
       dnsMs: 8 + rnd(20), tcpMs: null, handshakeMs: null, totalMs: 4000,
-      exitIp: null, exitCountry: null, errorDetail: 'fixture: tcp timeout',
+      exitIp: null, exitCountry: null, connectOk: null, errorDetail: 'fixture: tcp timeout',
     };
   }
   if (roll < 16) {
     return {
       success: false, failedLayer: 4, failureReason: 'AUTH_FAILED',
       dnsMs: 6 + rnd(15), tcpMs: 20 + rnd(60), handshakeMs: 30 + rnd(80), totalMs: 260,
-      exitIp: null, exitCountry: null, errorDetail: 'fixture: auth failed',
+      exitIp: null, exitCountry: null, connectOk: null, errorDetail: 'fixture: auth failed',
     };
   }
 
@@ -66,6 +66,9 @@ function fixtureProbe(seed: string): ProbeResult {
     totalMs: p50 + 30,
     exitIp: `${10 + rnd(200)}.${rnd(255)}.${rnd(255)}.${1 + rnd(253)}`,
     exitCountry: ['SG', 'JP', 'US', 'DE', 'HK', 'GB', 'NL', 'BR'][rnd(8)]!,
+    // 真实分布大约是存活节点里三分之一能开隧道（实测 40 个样本：20% 通 HTTPS、
+    // 40% 只能上明文 HTTP）。合成数据按同一比例造，回归测试才有意义。
+    connectOk: rnd(3) === 0,
     errorDetail: null,
   };
 }
@@ -282,6 +285,7 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
          p50_ms = $5, p95_ms = $6, jitter_ms = $7,
          success_rate_24h = $8,
          quality_score = $9,
+         connect_ok = COALESCE($10, connect_ok),
          scored_at = now(),
          updated_at = now()
        WHERE endpoint_id = $1`,
@@ -292,6 +296,10 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
         agg?.jitter ? Number(agg.jitter) : null,
         Math.round(successRate * 10000) / 10000,
         score,
+        // null = 这次没测（探测失败或 fixture），保留上一次的结论。
+        // 不能写成 `connect_ok = $10`：那样一次失败探测就会把已知的
+        // "支持隧道"抹成 NULL，池子排序会因此抖动。
+        r.connectOk,
       ],
     );
 
@@ -302,22 +310,41 @@ async function recordCheck(endpointId: string, jobId: string, r: ProbeResult): P
       await linkExitGeography(t, endpointId, r.exitIp, r.exitCountry);
     }
 
-    // 生命周期推进：连续失败 3 次才降级，避免抖动误伤
+    // 生命周期推进
     const cur = await t.q1<{ lifecycle_status: string; trust_tier: string }>(
       'SELECT lifecycle_status, trust_tier FROM proxy_endpoints WHERE id = $1',
       [endpointId],
     );
     let next: string | null = null;
     if (r.success) {
-      if (cur?.lifecycle_status === 'HEALTHY' || cur?.lifecycle_status === 'DEGRADED') {
-        next = cf > 0 ? 'DEGRADED' : 'HEALTHY';
+      if (cur?.lifecycle_status === 'HEALTHY') {
+        next = 'HEALTHY';
+      } else if (cur?.lifecycle_status === 'DEGRADED') {
+        // 降级后要连续两次成功才回到 HEALTHY：单次成功可能只是抖动，
+        // 和 VERIFIED → HEALTHY 用同一个门槛。
+        next = cs >= 2 ? 'HEALTHY' : 'DEGRADED';
       } else {
-        next = 'VERIFIED';
-        if (cs >= 2) next = 'HEALTHY';
+        next = cs >= 2 ? 'HEALTHY' : 'VERIFIED';
       }
-      if (cur?.lifecycle_status === 'VERIFIED' && cs >= 2) next = 'HEALTHY';
     } else if (cf >= 3) {
       next = 'UNAVAILABLE';
+    } else if (cur?.lifecycle_status === 'HEALTHY') {
+      /**
+       * 健康节点第一次失败就降到 DEGRADED。
+       *
+       * 这一步是**订阅新鲜度**的关键。HEALTHY 的复探周期是 360 分钟，
+       * DEGRADED 是 30 分钟。如果失败后留在 HEALTHY，要攒满 3 次连续失败
+       * 才会变成 UNAVAILABLE —— 而每次间隔 6 小时，也就是**一个已经死掉的
+       * 节点会在池子和订阅里赖 18 个小时**。
+       *
+       * 实测后果：对 300 个池成员做一次全量复探，其中 122 个当场就探测
+       * 失败，但它们全部仍是 HEALTHY、仍占着订阅里的名额。均匀抽样 40 个
+       * 去连 HTTPS，29 个完全不通（73%），而池子看起来"300 个健康节点"。
+       *
+       * 降到 DEGRADED 之后，30 分钟一轮复探，两次就能判死，一小时左右
+       * 清干净，池子可以自己愈合。
+       */
+      next = 'DEGRADED';
     }
 
     // 免费公开代理要能被判死，否则探测预算会被死节点永久吃掉。

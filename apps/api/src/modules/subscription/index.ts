@@ -61,6 +61,8 @@ interface EligibleEndpoint {
   p50_ms: number | null;
   credential_ref: string | null;
   country_code: string | null;
+  /** 能否开 CONNECT 隧道（访问 HTTPS）。null = 尚未检测。 */
+  connect_ok: boolean | null;
 }
 
 /** 一行规则的长度上限。用户手写，但一份订阅不该被塞进一兆字节的规则。 */
@@ -766,11 +768,14 @@ async function loadExportProxies(
 
   const endpoints = await q<EligibleEndpoint>(
     `SELECT v.id, v.protocol, v.host, v.port, v.trust_tier, v.quality_score, v.p50_ms,
-            v.credential_ref, v.country_code
+            v.credential_ref, v.country_code, v.connect_ok
      FROM v_subscription_eligible_endpoints v
      JOIN resource_pool_members m ON m.endpoint_id = v.id AND m.pool_id = $1 AND m.suppressed = false
      WHERE v.trust_tier::text = ANY($2::text[])
-     ORDER BY v.quality_score DESC, v.p50_ms ASC NULLS LAST
+     -- 能开隧道的排前面：订阅里的顺序就是用户在 Clash 里看到的顺序，
+     -- 也是 fallback / url-test 分组的初始优先序。只按质量分排会让
+     -- "只能上明文 HTTP"的节点混在前面 —— 实测存活节点里 60% 是这种。
+     ORDER BY v.connect_ok DESC NULLS LAST, v.quality_score DESC, v.p50_ms ASC NULLS LAST
      LIMIT 500`,
     [poolId, pool?.allowed_tiers ?? []],
   );

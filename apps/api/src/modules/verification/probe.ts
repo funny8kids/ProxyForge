@@ -31,6 +31,18 @@ export interface ProbeResult {
   totalMs: number;
   exitIp: string | null;
   exitCountry: string | null;
+  /**
+   * 能否建立 CONNECT 隧道（即能否访问 HTTPS）。
+   *
+   * `null` = 这次没测（探测本身失败了，或者 fixture 模式）。
+   * `false` = 只能转发明文 HTTP，在 Clash 里对绝大多数站点不可用。
+   *
+   * 为什么单独一个字段而不是让 `success` 直接反映它：这两件事的语义不同。
+   * 「能转发 HTTP」是代理成立的证据，「能开隧道」是它在浏览器里可用的证据。
+   * 把它们压成一个布尔值，就再也分不出「死节点」和「只能上 HTTP 的节点」——
+   * 而后者在免费代理里占存活节点的三分之二。
+   */
+  connectOk: boolean | null;
   errorDetail: string | null;
 }
 
@@ -78,6 +90,7 @@ export async function probe(target: ProbeTarget, timeoutMs = DEFAULT_TIMEOUT): P
     totalMs: 0,
     exitIp: null,
     exitCountry: null,
+    connectOk: null,
     errorDetail: null,
   };
 
@@ -126,6 +139,9 @@ export async function probe(target: ProbeTarget, timeoutMs = DEFAULT_TIMEOUT): P
       base.success = true;
       base.exitIp = exit.exitIp;
       base.exitCountry = exit.exitCountry;
+      // 隧道能力单独测一次。放在 success 判定**之后**：探测失败时没有
+      // 再测的必要，而失败的占九成，这一步不该给它们增加任何成本。
+      base.connectOk = await probeConnect(target, timeoutMs);
     } else {
       base.failedLayer = 4;
       base.failureReason = exit.reason;
@@ -137,6 +153,76 @@ export async function probe(target: ProbeTarget, timeoutMs = DEFAULT_TIMEOUT): P
 
   base.totalMs = Math.round(performance.now() - t0);
   return base;
+}
+
+/**
+ * 隧道能力探测：这个代理能不能 `CONNECT` 到 443。
+ *
+ * ## 为什么必须单独测
+ *
+ * 主探测用的是**绝对 URI 的明文 GET**（`GET http://ip-api.com/json`），
+ * 那验证的是"能不能正向转发 HTTP"，不是"能不能开隧道"。这两件事在免费
+ * 代理里差得非常远：实测 40 个 HEALTHY 节点，20% 能上 HTTPS、40% 只能上
+ * 明文 HTTP、40% 已经死了。也就是说 `success=true` 只说明"活着"，
+ * 而 Clash 里绝大多数站点是 HTTPS —— 只有 20% 的节点是真能用的。
+ *
+ * ## 为什么单独开一条连接而不是复用主探测的 socket
+ *
+ * 主探测那条连接已经 `Connection: close`，而且 SOCKS 那条隧道是通向
+ * `ip-api.com:80` 的，没法改成 443。复用只会让两种语义纠缠在一起。
+ * 代价是多一次 DNS + TCP，而且只在主探测**成功**时才发生（失败占九成，
+ * 它们一步都不会多走）。
+ *
+ * 目标选 `www.gstatic.com:443`：全球可达、不需要认证、不会因为地区封锁
+ * 而大面积误判。只看 `CONNECT` 的响应码，不真的做 TLS —— 我们要判断的
+ * 是"隧道开不开"，不是"证书对不对"。
+ */
+const CONNECT_DST = { host: 'www.gstatic.com', port: 443 } as const;
+
+async function probeConnect(target: ProbeTarget, timeoutMs: number): Promise<boolean> {
+  let address: string;
+  try {
+    const res = await withTimeout(lookup(target.host), timeoutMs, () => {
+      throw Object.assign(new Error('dns timeout'), { code: 'ETIMEOUT' });
+    });
+    address = res.address;
+  } catch {
+    return false;
+  }
+
+  let socket: Socket;
+  try {
+    socket = await connectTcp(address, target.port, timeoutMs);
+  } catch {
+    return false;
+  }
+
+  try {
+    if (target.protocol === 'SOCKS5') {
+      // null = 握手与 CONNECT 都成功
+      return (await socks5Handshake(socket, target, timeoutMs, CONNECT_DST)) === null;
+    }
+    if (target.protocol === 'SOCKS4') {
+      return (await socks4Handshake(socket, target, timeoutMs, CONNECT_DST)).ok;
+    }
+
+    const lines = [
+      `CONNECT ${CONNECT_DST.host}:${CONNECT_DST.port} HTTP/1.1`,
+      `Host: ${CONNECT_DST.host}:${CONNECT_DST.port}`,
+      'User-Agent: ProxyForge-Probe/1.0',
+    ];
+    if (target.username) {
+      const token = Buffer.from(`${target.username}:${target.password ?? ''}`, 'utf8').toString('base64');
+      lines.push(`Proxy-Authorization: Basic ${token}`);
+    }
+    socket.write([...lines, '', ''].join('\r\n'));
+    const raw = await readUntil(socket, timeoutMs, (s) => s.includes('\r\n\r\n'));
+    return /^HTTP\/1\.[01]\s+200/.test(raw);
+  } catch {
+    return false;
+  } finally {
+    socket.destroy();
+  }
 }
 
 function connectTcp(host: string, port: number, timeoutMs: number): Promise<Socket> {
@@ -310,17 +396,16 @@ function socks4Handshake(
   socket: Socket,
   target: ProbeTarget,
   timeoutMs: number,
+  dst: { host: string; port: number } = { host: 'ip-api.com', port: 80 },
 ): Promise<Negotiation> {
-  const host = 'ip-api.com';
-  const port = 80;
   const user = Buffer.from(target.username ?? '', 'utf8');
   const req = Buffer.concat([
     Buffer.from([0x04, 0x01]), // VN=4, CD=1 CONNECT
-    Buffer.from([port >> 8, port & 0xff]),
+    Buffer.from([dst.port >> 8, dst.port & 0xff]),
     Buffer.from([0x00, 0x00, 0x00, 0x01]), // SOCKS4a：无效 IP，域名在后面
     user,
     Buffer.from([0x00]),
-    Buffer.from(host, 'utf8'),
+    Buffer.from(dst.host, 'utf8'),
     Buffer.from([0x00]),
   ]);
   socket.write(req);
@@ -348,6 +433,7 @@ async function socks5Handshake(
   socket: Socket,
   target: ProbeTarget,
   timeoutMs: number,
+  dst: { host: string; port: number } = { host: 'ip-api.com', port: 80 },
 ): Promise<Negotiation | null> {
   // 方法协商：有凭据时同时提供「无认证」和「用户名密码」(0x02)，
   // 由服务端选。只给 0x00 的话，带认证的代理会直接回 0xFF 拒绝全部方法。
@@ -388,13 +474,13 @@ async function socks5Handshake(
     }
   }
 
-  // CONNECT ip-api.com:80
-  const hostBytes = Buffer.from('ip-api.com', 'utf8');
+  // CONNECT dst
+  const hostBytes = Buffer.from(dst.host, 'utf8');
   socket.write(
     Buffer.concat([
       Buffer.from([0x05, 0x01, 0x00, 0x03, hostBytes.length]),
       hostBytes,
-      Buffer.from([0x00, 0x50]),
+      Buffer.from([dst.port >> 8, dst.port & 0xff]),
     ]),
   );
   const reply = await readBytes(socket, 10, timeoutMs);

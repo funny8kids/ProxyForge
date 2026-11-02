@@ -277,6 +277,77 @@ await check('零样本按先验半分，不按 0 分', async () => {
   assert.ok(none > allFail, `没探过 (${none}) 不该低于全失败 (${allFail})`);
 });
 
+console.log('\n[隧道能力 connect_ok]');
+
+await check('成功探测会写入 connect_ok，失败探测不会把它抹掉', async () => {
+  // 语义要点：`connect_ok = null` 表示"这次没测"，写入时必须 COALESCE 保留旧值。
+  // 如果写成直接赋值，一次失败探测就会把已知的"支持隧道"抹成 NULL ——
+  // 池子与订阅都按 connect_ok 排序，节点会在排序里来回跳。
+  const ids: string[] = [];
+  for (let i = 0; i < 24; i += 1) {
+    const id = await mkEndpoint(`connect-${i}`);
+    // 先给它一个已知结论，再看失败探测会不会覆盖掉
+    await exec(`UPDATE endpoint_health_state SET connect_ok = true WHERE endpoint_id = $1`, [id]);
+    ids.push(id);
+  }
+
+  const jobId = await mkJob(ids);
+  await withTimeout(runVerificationJob(jobId), 30000, '验证任务');
+
+  const rows = await q1<{ ok_fail: string; kept: string; succ_null: string; total: string }>(
+    `SELECT
+       count(*) FILTER (WHERE hc.success = false AND hs.connect_ok IS NOT true)::text AS ok_fail,
+       count(*) FILTER (WHERE hc.success = true  AND hs.connect_ok IS NOT NULL)::text AS kept,
+       count(*) FILTER (WHERE hc.success = true  AND hs.connect_ok IS NULL)::text     AS succ_null,
+       count(*)::text AS total
+     FROM endpoint_health_state hs
+     JOIN LATERAL (
+       SELECT success FROM health_checks WHERE endpoint_id = hs.endpoint_id
+       ORDER BY checked_at DESC LIMIT 1
+     ) hc ON true
+     WHERE hs.endpoint_id = ANY($1::uuid[])`,
+    [ids],
+  );
+
+  assert.equal(Number(rows?.ok_fail), 0, '失败探测把已有的 connect_ok 抹掉了');
+  assert.equal(Number(rows?.succ_null), 0, '成功探测必须给出确定的 connect_ok');
+  assert.ok(Number(rows?.kept) > 0, '样本里没有任何成功探测，断言没有意义');
+  assert.equal(Number(rows?.total), 24);
+});
+
+await check('健康节点失败一次就降到 DEGRADED', async () => {
+  // 为什么这条重要：HEALTHY 的复探周期 360 分钟、DEGRADED 是 30 分钟。
+  // 失败后留在 HEALTHY 的话，要攒满 3 次连续失败才变 UNAVAILABLE，
+  // 也就是一个已经死掉的节点会在池子和订阅里赖 18 小时。
+  // 实测：300 个池成员全量复探，122 个当场失败却全部仍是 HEALTHY，
+  // 均匀抽 40 个连 HTTPS，29 个完全不通。
+  const ids: string[] = [];
+  for (let i = 0; i < 24; i += 1) {
+    const id = await mkEndpoint(`degrade-${i}`);
+    await exec(`UPDATE proxy_endpoints SET lifecycle_status = 'HEALTHY' WHERE id = $1`, [id]);
+    ids.push(id);
+  }
+
+  const jobId = await mkJob(ids);
+  await withTimeout(runVerificationJob(jobId), 30000, '验证任务');
+
+  const bad = await q1<{ c: string }>(
+    `SELECT count(*)::text AS c
+       FROM endpoint_health_state hs
+       JOIN proxy_endpoints e ON e.id = hs.endpoint_id
+       JOIN LATERAL (
+         SELECT success FROM health_checks WHERE endpoint_id = hs.endpoint_id
+         ORDER BY checked_at DESC LIMIT 1
+       ) hc ON true
+      WHERE hs.endpoint_id = ANY($1::uuid[])
+        AND hc.success = false
+        AND hs.consecutive_failures = 1
+        AND e.lifecycle_status <> 'DEGRADED'`,
+    [ids],
+  );
+  assert.equal(Number(bad?.c), 0, '首次失败的节点必须降级，否则要 18 小时才会被摘掉');
+});
+
 await closeDb();
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);
 process.exit(fail === 0 ? 0 : 1);

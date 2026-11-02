@@ -17,9 +17,11 @@ import type { ProxyProtocol } from '@proxyforge/contracts';
  * sing-box 里只有 46 个」这种没法解释的差异。
  */
 
-export type ExportFormat = 'mihomo' | 'clash' | 'singbox' | 'base64' | 'plain';
+export type ExportFormat = 'mihomo' | 'clash' | 'singbox' | 'base64' | 'plain' | 'clash-provider';
 
-export const EXPORT_FORMATS: ExportFormat[] = ['mihomo', 'clash', 'singbox', 'base64', 'plain'];
+export const EXPORT_FORMATS: ExportFormat[] = [
+  'mihomo', 'clash', 'singbox', 'base64', 'plain', 'clash-provider',
+];
 
 /** 带凭据的节点。protocol 保留原始枚举，各渲染器自己映射。 */
 export interface ExportProxy {
@@ -29,6 +31,14 @@ export interface ExportProxy {
   port: number;
   username?: string;
   password?: string;
+  /**
+   * 出口国家（ISO 3166-1 alpha-2）。用于命名模板的 `{country}` 占位符。
+   *
+   * 刻意**不写进 YAML 的节点字段**：mihomo 没有 country 字段，写进去会被
+   * 当成未知键。用户要按地区分组，只能靠节点名里带国家码 ——
+   * 所以 `{country}` 的作用就是让名字里带上它。
+   */
+  country?: string | null;
 }
 
 export interface Rendered {
@@ -170,6 +180,10 @@ export function normalizeFormat(v: string | null | undefined, fallback: ExportFo
   if (s === 'singbox' || s === 'sing-box' || s === 'json') return 'singbox';
   if (s === 'base64' || s === 'b64') return 'base64';
   if (s === 'plain' || s === 'txt' || s === 'text') return 'plain';
+  // provider 只出节点列表，供 mihomo 的 proxy-providers 引用。
+  // 接受几个常见叫法，避免前端传 `provider` 时静默退化成整份配置 ——
+  // 那会让用户以为拿到了片段，实际又覆盖了一次他的 config.yaml。
+  if (s === 'clash-provider' || s === 'provider' || s === 'mihomo-provider') return 'clash-provider';
   return fallback;
 }
 
@@ -202,6 +216,13 @@ export function renderSubscription(
         body: renderPlain(poolKey, proxies, generatedAt),
         contentType: 'text/plain; charset=utf-8',
         extension: 'txt',
+        format,
+      };
+    case 'clash-provider':
+      return {
+        body: renderMihomoProvider(poolKey, proxies, generatedAt),
+        contentType: 'text/yaml; charset=utf-8',
+        extension: 'yaml',
         format,
       };
     case 'clash':
@@ -254,6 +275,28 @@ function yamlScalar(value: string): string {
   if (/[\s:#@&*!|>'"`{}\[\],\\%]/.test(value) || /^[-?]/.test(value)) return quote(value);
 
   return value;
+}
+
+/**
+ * 节点条目序列化。
+ *
+ * 抽出来是因为「整份配置」和「provider 片段」两种输出必须给出**完全一样**的
+ * 节点块。各写一份的后果不是编译错误，而是两处慢慢分叉：某天给整份配置加了
+ * `udp: true`，provider 里没有 —— 同一批节点在不同用法下行为不一致，
+ * 而用户只会觉得"这个订阅有时候好使有时候不好使"。
+ */
+function proxyEntries(proxies: ExportProxy[]): string[] {
+  const lines: string[] = [];
+  for (const p of proxies) {
+    lines.push(`  - name: ${yamlScalar(p.name)}`);
+    lines.push(`    type: ${MIHOMO_TYPE[p.protocol]}`);
+    lines.push(`    server: ${yamlScalar(p.server)}`);
+    lines.push(`    port: ${p.port}`);
+    // socks4 不支持用户名密码，写进去某些内核会直接报错
+    if (p.username && p.protocol !== 'SOCKS4') lines.push(`    username: ${yamlScalar(p.username)}`);
+    if (p.password && p.protocol !== 'SOCKS4') lines.push(`    password: ${yamlScalar(p.password)}`);
+  }
+  return lines;
 }
 
 export function renderMihomo(
@@ -319,15 +362,7 @@ export function renderMihomo(
   }
 
   lines.push('proxies:');
-  for (const p of proxies) {
-    lines.push(`  - name: ${yamlScalar(p.name)}`);
-    lines.push(`    type: ${MIHOMO_TYPE[p.protocol]}`);
-    lines.push(`    server: ${yamlScalar(p.server)}`);
-    lines.push(`    port: ${p.port}`);
-    // socks4 不支持用户名密码，写进去某些内核会直接报错
-    if (p.username && p.protocol !== 'SOCKS4') lines.push(`    username: ${yamlScalar(p.username)}`);
-    if (p.password && p.protocol !== 'SOCKS4') lines.push(`    password: ${yamlScalar(p.password)}`);
-  }
+  lines.push(...proxyEntries(proxies));
 
   lines.push('proxy-groups:');
   lines.push(`  - name: ${yamlScalar(poolKey)}`);
@@ -346,6 +381,59 @@ export function renderMihomo(
     // 而 `MATCH,"a,b"` 这种半引用是坏 YAML —— 要么整行引用，要么不引用。
     lines.push(`  - ${yamlQuoted(mihomoRuleLine(r, poolKey))}`);
   }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * mihomo proxy-provider 片段。
+ *
+ * 只输出 `proxies:` 一个顶层键 —— 这是 provider 文件的全部约定。
+ * 刻意不带 mixed-port / dns / rules：那些属于用户自己的 config.yaml。
+ * 在这里也写一遍的后果是，用户每次更新订阅都会把自己调好的 DNS 与分流
+ * 覆盖回默认值，而且覆盖是静默的 —— 他不会看到任何提示，只会觉得
+ * "怎么过一段时间规则就乱了"。
+ *
+ * 文件头的用法注释也是刻意留的：拿到一份只有 proxies 的 YAML，
+ * 绝大多数人第一反应是"这配置不完整，导入报错"，然后来问为什么。
+ * 把正确的引用方式直接写在文件里，比写在文档里有用得多。
+ */
+export function renderMihomoProvider(
+  poolKey: string,
+  proxies: ExportProxy[],
+  generatedAt: string,
+): string {
+  const providerKey = poolKey.toLowerCase();
+  const lines: string[] = [];
+  lines.push('# ProxyForge proxy provider');
+  lines.push(`# pool: ${poolKey}`);
+  lines.push(`# generated: ${generatedAt}`);
+  lines.push(`# nodes: ${proxies.length}`);
+  lines.push('#');
+  lines.push('# 这不是一份完整的 Clash 配置，只包含节点列表。');
+  lines.push('# 在你自己 config.yaml 的 proxy-providers 下引用本订阅地址：');
+  lines.push('#');
+  lines.push('#   proxy-providers:');
+  lines.push(`#     ${providerKey}:`);
+  lines.push('#       type: http');
+  lines.push('#       url: "<本订阅地址>"');
+  lines.push('#       interval: 3600');
+  lines.push(`#       path: ./providers/${providerKey}.yaml`);
+  lines.push('#       health-check:');
+  lines.push('#         enable: true');
+  lines.push('#         url: http://www.gstatic.com/generate_204');
+  lines.push('#         interval: 300');
+  lines.push('#');
+  lines.push(`# 然后在 proxy-groups 里用 "use: [${providerKey}]" 引用它。`);
+  lines.push('#');
+  lines.push('# 公开代理：可用性不等于合法性，不要用它们承载生产流量或登录凭据。');
+
+  if (proxies.length === 0) {
+    lines.push('proxies: []');
+    return `${lines.join('\n')}\n`;
+  }
+
+  lines.push('proxies:');
+  lines.push(...proxyEntries(proxies));
   return `${lines.join('\n')}\n`;
 }
 

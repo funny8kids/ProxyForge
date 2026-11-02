@@ -17,7 +17,17 @@ export type NodeFilter = SubscriptionNodeFilter;
 
 const PROTOCOLS: ProxyProtocol[] = ['HTTP', 'HTTPS_CONNECT', 'SOCKS4', 'SOCKS5'];
 
-export const DEFAULT_MAX_NODES = 200;
+/**
+ * 单份订阅的节点数上限。
+ *
+ * 定在 500 而不是 200：实验池容量已经提到 300，上限若还是 200，
+ * 池里有 100 个成员永远发不出去，而界面上"池 300 个成员 / 订阅 200 个节点"
+ * 两个数字都"没错"，只是对不上 —— 这种不一致最难排查。
+ *
+ * 500 仍然远小于"整池全发"的量级：mihomo 加载几百个节点是常态，
+ * 但上千个会让客户端启动时的 url-test 拖到几十秒。
+ */
+export const DEFAULT_MAX_NODES = 500;
 
 function asProtocolList(v: unknown): ProxyProtocol[] {
   if (!Array.isArray(v)) return [];
@@ -33,6 +43,26 @@ function asNumber(v: unknown, min: number, max: number): number | undefined {
   const n = typeof v === 'number' ? v : Number(v);
   if (!Number.isFinite(n)) return undefined;
   return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * 国家码归一化。
+ *
+ * 只接受两位字母，统一大写。`country_code` 在库里是 `char(2)`，
+ * 而用户手写配置时经常是 `jp`、`JP`、`Jp` 混着来 —— 大小写不一致会让
+ * 白名单静默匹配不上（订阅发出去 0 个节点，却不报任何错）。
+ *
+ * 三字母（`JPN`）直接丢弃而不是猜：猜错会把用户送到另一个国家，
+ * 而订阅里节点名写着国家码，他不会想到是过滤条件写错了。
+ */
+function asCountryList(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const seen = new Set<string>();
+  for (const item of v) {
+    const code = String(item).trim().toUpperCase();
+    if (/^[A-Z]{2}$/.test(code)) seen.add(code);
+  }
+  return [...seen].slice(0, 60);
 }
 
 /**
@@ -69,6 +99,12 @@ export function normalizeNodeFilter(raw: unknown): NodeFilter {
   const maxNodes = asNumber(r['maxNodes'], 1, DEFAULT_MAX_NODES);
   if (maxNodes !== undefined) out.maxNodes = Math.floor(maxNodes);
 
+  const countries = asCountryList(r['countries']);
+  if (countries.length) out.countries = countries;
+
+  const excludeCountries = asCountryList(r['excludeCountries']);
+  if (excludeCountries.length) out.excludeCountries = excludeCountries;
+
   return out;
 }
 
@@ -77,6 +113,8 @@ export interface FilterableEndpoint {
   host: string;
   quality_score: string | number;
   p50_ms: number | null;
+  /** 出口国家，ISO 3166-1 alpha-2；未探测出出口 IP 时为 null */
+  country_code?: string | null;
 }
 
 /**
@@ -90,6 +128,8 @@ export function applyNodeFilter<T extends FilterableEndpoint>(rows: T[], filter:
   const allow = filter.protocols && filter.protocols.length ? new Set(filter.protocols) : null;
   const deny = new Set(filter.excludeProtocols ?? []);
   const hosts = filter.excludeHosts ?? [];
+  const allowCountry = filter.countries && filter.countries.length ? new Set(filter.countries) : null;
+  const denyCountry = new Set(filter.excludeCountries ?? []);
 
   const kept = rows.filter((r) => {
     if (allow && !allow.has(r.protocol)) return false;
@@ -105,6 +145,14 @@ export function applyNodeFilter<T extends FilterableEndpoint>(rows: T[], filter:
       const h = r.host.toLowerCase();
       if (hosts.some((p) => h.includes(p))) return false;
     }
+    // 国家过滤对「未知」的处理是排除而不是放行：用户写 `countries: [JP]`
+    // 是明确要日本节点，一个还没探出出口 IP 的节点不能算作"可能是日本"。
+    // 反过来，黑名单里的未知节点仍然放行 —— 用户说"不要中国节点"，
+    // 不代表他要"只要已知非中国的节点"。
+    if (allowCountry) {
+      if (!r.country_code || !allowCountry.has(r.country_code)) return false;
+    }
+    if (denyCountry.size > 0 && r.country_code && denyCountry.has(r.country_code)) return false;
     return true;
   });
 
@@ -115,9 +163,12 @@ export function applyNodeFilter<T extends FilterableEndpoint>(rows: T[], filter:
 /**
  * 命名模板。
  *
- * 支持的占位符：`{index}` `{protocol}` `{host}` `{port}` `{pool}`。
+ * 支持的占位符：`{index}` `{protocol}` `{host}` `{port}` `{pool}` `{country}`。
  * 不支持的占位符原样保留 —— 与其悄悄吞掉用户写错的 `{region}`，
  * 不如让他在节点名里看见它。
+ *
+ * `{country}` 在没有出口国家时退化成 `??` 而不是空串：空串会让
+ * `pf-JP-01` 变成 `pf--01`，而 `??` 一眼就能看出这个节点还没探出地区。
  *
  * 模板可以是空串（沿用默认 `pf-01`）。空模板不会产出空名字：
  * 客户端里出现一个名字为空的节点，界面上就是个无法点选的空白行。
@@ -138,6 +189,7 @@ export function applyNameTemplate(
       .replace(/\{protocol\}/g, p.protocol.toLowerCase())
       .replace(/\{host\}/g, p.server)
       .replace(/\{port\}/g, String(p.port))
+      .replace(/\{country\}/g, p.country ?? '??')
       .replace(/\{pool\}/g, poolKey);
 
     // mihomo 遇到重名节点会直接拒绝加载整份配置。

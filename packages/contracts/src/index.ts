@@ -458,7 +458,11 @@ export interface SubscriptionNodeFilter {
   maxLatencyMs?: number;
   /** 主机名黑名单，子串匹配 */
   excludeHosts?: string[];
-  /** 节点数上限，1–200 */
+  /** 出口国家白名单，ISO 3166-1 alpha-2（如 SG / JP / US） */
+  countries?: string[];
+  /** 出口国家黑名单 */
+  excludeCountries?: string[];
+  /** 节点数上限，1–500 */
   maxNodes?: number;
 }
 
@@ -471,7 +475,7 @@ export interface SubscriptionRow {
   poolId: string;
   poolKey: string;
   /** 默认导出格式；拉取时可用 ?format= 覆盖 */
-  format: 'mihomo' | 'clash' | 'singbox' | 'base64' | 'plain';
+  format: 'mihomo' | 'clash' | 'singbox' | 'base64' | 'plain' | 'clash-provider';
   tokenPrefix: string;
   signingEnabled: boolean;
   revision: number;

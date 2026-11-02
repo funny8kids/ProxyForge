@@ -12,8 +12,10 @@
 import assert from 'node:assert/strict';
 import {
   renderMihomo,
+  renderMihomoProvider,
   renderSingBox,
   renderSubscription,
+  normalizeFormat,
   normalizeRoutingMode,
   type ExportProxy,
 } from '../apps/api/src/modules/subscription/render.js';
@@ -186,8 +188,8 @@ check('主机名黑名单是子串匹配', () => {
   assert.equal(kept.length, 3);
 });
 
-check('maxNodes 越界被夹到 1–200', () => {
-  assert.equal(normalizeNodeFilter({ maxNodes: 99_999 }).maxNodes, 200);
+check('maxNodes 越界被夹到 1–500', () => {
+  assert.equal(normalizeNodeFilter({ maxNodes: 99_999 }).maxNodes, 500);
   assert.equal(normalizeNodeFilter({ maxNodes: 0 }).maxNodes, 1);
   assert.equal(normalizeNodeFilter({ maxNodes: 'abc' }).maxNodes, undefined);
 });
@@ -232,6 +234,105 @@ check('base64 / plain 不受分流设置影响（它们不带规则）', () => {
   const a = renderSubscription('plain', 'pool-a', PROXIES, 'now', { routingMode: 'global' });
   const b = renderSubscription('plain', 'pool-a', PROXIES, 'now', { routingMode: 'rule' });
   assert.equal(a.body, b.body);
+});
+
+console.log('\n[7] proxy-provider 片段');
+
+check('provider 只出 proxies，不带 mixed-port / dns / rules', () => {
+  const body = renderMihomoProvider('pool-a', PROXIES, 'now');
+  assert.ok(body.includes('proxies:'));
+  assert.ok(!/^mixed-port:/m.test(body), 'provider 里出现 mixed-port 会覆盖用户主配置的监听端口');
+  assert.ok(!/^dns:/m.test(body), 'provider 里出现 dns 会覆盖用户调好的 DNS');
+  assert.ok(!/^rules:/m.test(body), 'provider 里出现 rules 会覆盖用户的分流规则');
+  assert.ok(!/^proxy-groups:/m.test(body), 'proxy-groups 属于用户主配置，不属于 provider');
+});
+
+check('provider 与整份配置的节点块逐字一致', () => {
+  const provider = renderMihomoProvider('pool-a', PROXIES, 'now');
+  const full = renderMihomo('pool-a', PROXIES, 'now', 'global', []);
+  const pickNodes = (s: string): string[] => {
+    const lines = s.split('\n');
+    const start = lines.findIndex((l) => l === 'proxies:');
+    const out: string[] = [];
+    for (let i = start + 1; i < lines.length; i += 1) {
+      const l = lines[i]!;
+      if (l.startsWith('  - ') || l.startsWith('    ')) out.push(l);
+      else break;
+    }
+    return out;
+  };
+  // 两处各写一份序列化逻辑，迟早会分叉成"整配置里有 udp、provider 里没有"，
+  // 同一批节点在不同用法下行为不一致，而用户只会觉得"这订阅时好时坏"。
+  assert.deepEqual(pickNodes(provider), pickNodes(full));
+});
+
+check('空池 provider 输出 proxies: [] 而不是空文件', () => {
+  const body = renderMihomoProvider('pool-a', [], 'now');
+  assert.ok(body.includes('proxies: []'), '空文件会让 mihomo 报 provider 解析失败');
+});
+
+check('provider 文件里写明引用方式', () => {
+  const body = renderMihomoProvider('PUBLIC_EXPERIMENTAL', PROXIES, 'now');
+  // 拿到一份只有 proxies 的 YAML，第一反应是"配置不完整"，所以用法必须写进文件
+  assert.ok(body.includes('proxy-providers:'));
+  assert.ok(body.includes('use: [public_experimental]'));
+});
+
+check('normalizeFormat 认 provider 的几种叫法', () => {
+  assert.equal(normalizeFormat('clash-provider'), 'clash-provider');
+  assert.equal(normalizeFormat('provider'), 'clash-provider');
+  assert.equal(normalizeFormat('mihomo-provider'), 'clash-provider');
+  // 拼错时退回默认值，而不是悄悄给一份整配置 —— 后者会覆盖用户的 config.yaml
+  assert.equal(normalizeFormat('clash'), 'clash');
+  assert.equal(normalizeFormat('singbox'), 'singbox');
+});
+
+console.log('\n[8] 出口国家过滤');
+
+const GEO = [
+  { protocol: 'SOCKS5' as const, host: 'a', quality_score: 90, p50_ms: 100, country_code: 'JP' },
+  { protocol: 'SOCKS5' as const, host: 'b', quality_score: 80, p50_ms: 200, country_code: 'SG' },
+  { protocol: 'SOCKS5' as const, host: 'c', quality_score: 70, p50_ms: 300, country_code: null },
+];
+
+check('国家白名单排除未知国家', () => {
+  // 用户写 countries:[JP] 是要日本节点，一个还没探出出口 IP 的节点
+  // 不能算作"可能是日本" —— 放进去只会让订阅里出现一堆不该有的节点
+  const kept = applyNodeFilter(GEO, { countries: ['JP'] });
+  assert.deepEqual(kept.map((r) => r.host), ['a']);
+});
+
+check('国家黑名单保留未知国家', () => {
+  // 反过来，"不要中国节点"不代表"只要已知非中国的节点"
+  const kept = applyNodeFilter(GEO, { excludeCountries: ['SG'] });
+  assert.deepEqual(kept.map((r) => r.host), ['a', 'c']);
+});
+
+check('国家码归一化：小写转大写，三字母丢弃', () => {
+  const f = normalizeNodeFilter({ countries: ['jp', 'Sg', 'JPN', '  us  ', ''] });
+  assert.deepEqual(f.countries, ['JP', 'SG', 'US']);
+});
+
+check('国家过滤与协议过滤可叠加', () => {
+  const mixed = [
+    ...GEO,
+    { protocol: 'HTTP' as const, host: 'd', quality_score: 95, p50_ms: 50, country_code: 'JP' },
+  ];
+  const kept = applyNodeFilter(mixed, { protocols: ['SOCKS5'], countries: ['JP'] });
+  assert.deepEqual(kept.map((r) => r.host), ['a']);
+});
+
+check('命名模板支持 {country}，未知国家退化成 ??', () => {
+  const named = applyNameTemplate(
+    [
+      { name: '', protocol: 'SOCKS5', server: '1.1.1.1', port: 1, country: 'JP' },
+      { name: '', protocol: 'SOCKS5', server: '2.2.2.2', port: 2, country: null },
+    ],
+    'pf-{country}-{index}',
+    'pool-a',
+  );
+  // 空串会让名字变成 pf--01，而 ?? 一眼能看出这个节点还没探出地区
+  assert.deepEqual(named.map((p) => p.name), ['pf-JP-01', 'pf-??-02']);
 });
 
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);

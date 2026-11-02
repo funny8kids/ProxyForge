@@ -60,6 +60,7 @@ interface EligibleEndpoint {
   quality_score: string;
   p50_ms: number | null;
   credential_ref: string | null;
+  country_code: string | null;
 }
 
 /** 一行规则的长度上限。用户手写，但一份订阅不该被塞进一兆字节的规则。 */
@@ -764,7 +765,8 @@ async function loadExportProxies(
   );
 
   const endpoints = await q<EligibleEndpoint>(
-    `SELECT v.id, v.protocol, v.host, v.port, v.trust_tier, v.quality_score, v.p50_ms, v.credential_ref
+    `SELECT v.id, v.protocol, v.host, v.port, v.trust_tier, v.quality_score, v.p50_ms,
+            v.credential_ref, v.country_code
      FROM v_subscription_eligible_endpoints v
      JOIN resource_pool_members m ON m.endpoint_id = v.id AND m.pool_id = $1 AND m.suppressed = false
      WHERE v.trust_tier::text = ANY($2::text[])
@@ -811,6 +813,8 @@ async function loadExportProxies(
       protocol: e.protocol,
       server: e.host,
       port: e.port,
+      // char(2) 在 PG 里会补空格到定长，直接拼进节点名会变成 `pf-JP -01`
+      country: e.country_code ? e.country_code.trim() : null,
     };
     const cred = e.credential_ref ? creds.get(e.credential_ref) : undefined;
     if (cred) {

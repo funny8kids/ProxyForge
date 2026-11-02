@@ -4,7 +4,7 @@
  * 跑在内存库（`DATABASE_URL=memory://`）。
  *
  * 这个调度器唯一容易做错的地方是**排序**：按"上次探测时间"排会让一堆
- * 6 小时周期的 HEALTHY 节点长期霸占预算，10 分钟周期的新候选永远轮不上。
+ * 长周期的 HEALTHY 节点长期霸占预算，短周期的新候选永远轮不上。
  * 所以断言的重点是「谁先被探」，而不是「入队了几个」。
  *
  * 跑法：npm run test:schedule
@@ -155,6 +155,24 @@ async function mkStuckJob(status: 'PENDING' | 'RUNNING', ageMin: number): Promis
   return row!.id;
 }
 
+/**
+ * 造一个「建了但从未被认领」的调度任务：`started_at` 为 NULL。
+ *
+ * 这种形态的年龄只能靠 created_at 衡量 —— 这正是修复的核心：
+ * 闸门与回收都要用 `COALESCE(started_at, created_at)` 判断，
+ * 否则「没开始」会被当成「刚刚开始」，永远活着。
+ */
+async function mkUnclaimedJob(ageMin: number): Promise<string> {
+  const row = await q1<{ id: string }>(
+    `INSERT INTO verification_jobs (scope, endpoint_ids, status, total, priority, filter, created_at)
+     VALUES ('ENDPOINTS', ARRAY[]::uuid[], 'PENDING', 1, 50, '{"source":"scheduler"}'::jsonb,
+             now() - ($1 || ' minutes')::interval)
+     RETURNING id`,
+    [String(ageMin)],
+  );
+  return row!.id;
+}
+
 await check('PENDING 但已超窗的僵尸任务不再挡住入队', async () => {
   // 真实事故：进程在探测途中被强杀，任务停在 PENDING、started_at 已写。
   // 回收只扫 RUNNING，闸门却看 PENDING+RUNNING —— 两套条件分叉的结果是
@@ -168,6 +186,38 @@ await check('PENDING 但已超窗的僵尸任务不再挡住入队', async () =>
 
   const after = await q1<{ status: string }>('SELECT status FROM verification_jobs WHERE id = $1', [zombie]);
   assert.equal(after?.status, 'FAILED', '超窗任务必须被标 FAILED，而不是留在 PENDING 里反复失败');
+  await clearSchedulerJobs();
+});
+
+await check('从未被认领的 PENDING 任务超窗后同样要回收', async () => {
+  // 真实事故（第二次踩同一个坑）：任务是 PENDING 且 started_at 为 NULL ——
+  // 建了但一次都没被认领。旧闸门把 `started_at IS NULL` 当成"刚刚开始"，
+  // 于是它永远算活跃；旧回收又要求 `started_at IS NOT NULL`，永远碰不到它。
+  // 两边合起来是永久死锁：探测停摆 96 分钟，日志每 15 秒一行「探测暂停」，
+  // 没有任何报错，库里所有端点再也没被探过一次。
+  await mkEndpoint('PENDING_VERIFICATION', null);
+  const unclaimed = await mkUnclaimedJob(30);
+
+  const r = await enqueueDueProbes();
+  assert.equal(r.reason, undefined, '未认领且超窗的任务不该挡住入队');
+  assert.ok(r.jobId, '必须放行新任务');
+
+  const after = await q1<{ status: string }>('SELECT status FROM verification_jobs WHERE id = $1', [unclaimed]);
+  assert.equal(after?.status, 'FAILED', '未认领但超窗的任务必须被标 FAILED');
+  await clearSchedulerJobs();
+});
+
+await check('刚创建、还没被认领的任务仍然挡住入队', async () => {
+  // 反面断言：把 COALESCE 加上之后，闸门不能对"排队中的正常任务"失效。
+  // 前一个批次还在跑时，新批次排队是正确的行为。
+  await mkEndpoint('PENDING_VERIFICATION', null);
+  const queued = await mkUnclaimedJob(0);
+
+  const r = await enqueueDueProbes();
+  assert.equal(r.reason, 'busy', '排队中的正常任务必须挡住入队');
+  assert.equal(r.picked, 0);
+
+  await exec(`UPDATE verification_jobs SET status='SUCCEEDED', finished_at=now() WHERE id=$1`, [queued]);
   await clearSchedulerJobs();
 });
 
@@ -205,7 +255,7 @@ await check('重启时 RUNNING 任务被重置且清空 started_at', async () =>
 });
 
 console.log('\n[2] 到期入队');
-await check('HEALTHY 超过 6 小时 → 入队', async () => {
+await check('HEALTHY 超过复探周期 → 入队', async () => {
   const id = await mkEndpoint('HEALTHY', 400);
   const r = await enqueueDueProbes();
   assert.ok(r.jobId, '应该创建任务');
@@ -231,8 +281,8 @@ await check('同档内：超期更狠的先探', async () => {
   // "30 分钟周期的节点超期 30 分钟"前面，后者其实更急。
   await settleAllEndpoints();
   await clearSchedulerJobs();
-  const older = await mkEndpoint('HEALTHY', 3600); // 360 分钟周期，超期 10 倍
-  const newer = await mkEndpoint('HEALTHY', 400); // 超期 1.1 倍
+  const older = await mkEndpoint('HEALTHY', 3600); // 欠得极多
+  const newer = await mkEndpoint('HEALTHY', 400); // 也超期，但欠得少得多
   const r = await enqueueDueProbes();
   const ids = await jobEndpointIds(r.jobId!);
   assert.ok(ids.includes(older) && ids.includes(newer));
@@ -292,7 +342,7 @@ await check('HEALTHY 有保底份额，不会被 VERIFIED 挤掉', async () => {
   await settleAllEndpoints();
   await clearSchedulerJobs();
   for (let i = 0; i < 200; i += 1) await mkEndpoint('VERIFIED', 30);
-  const healthy = await mkEndpoint('HEALTHY', 400); // 超期 1.1 倍，只比刚到期的多一点点
+  const healthy = await mkEndpoint('HEALTHY', 400); // 超期，但相对 VERIFIED 不算欠得多
   const r = await enqueueDueProbes(40);
   const ids = await jobEndpointIds(r.jobId!);
   assert.ok(ids.includes(healthy), 'HEALTHY 必须分到配额，否则死节点会一直留在订阅里');
@@ -354,7 +404,14 @@ await check('scheduleBacklog 覆盖全部档位，且 due ≤ total', async () =
     assert.ok(t.intervalMin === null || t.intervalMin > 0);
   }
   const healthy = tiers.find((t) => t.status === 'HEALTHY');
-  assert.equal(healthy?.intervalMin, 360);
+  // 断言上限而不是具体值：这个数的意义是「订阅快照能有多陈旧」，
+  // 不是「常量等于几」。公开代理存活期是几十分钟级别，复探周期一旦
+  // 到了小时量级，订阅发出去的全是几小时前的状态 —— 实测过一次：
+  // 池里 300 个成员没有一个在 30 分钟内成功过，位置 50 之后可用率 0%。
+  assert.ok(
+    healthy?.intervalMin !== null && (healthy?.intervalMin ?? 0) > 0 && (healthy?.intervalMin ?? 0) <= 60,
+    `HEALTHY 复探周期 ${healthy?.intervalMin} 分钟太长，订阅会发陈旧快照`,
+  );
 });
 
 await closeDb();

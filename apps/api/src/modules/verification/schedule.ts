@@ -46,8 +46,19 @@ export const TIER_INTERVAL_MIN: Record<string, number | null> = {
   // 而订阅只收 HEALTHY/DEGRADED —— 等于导入当天完全不可用。
   VERIFIED: 15,
   UNAVAILABLE: 120,
-  // 已经能用，探它只是确认还活着
-  HEALTHY: 360,
+  // 已经能用，但必须持续确认它**现在**还能用。
+  //
+  // 这里从 360 分钟降到 30 分钟。360 分钟对公开代理池是完全错的量级：
+  // 免费节点存活期是几十分钟，而订阅只收 HEALTHY/DEGRADED —— 节点一旦
+  // 晋级就 6 小时无人过问，订阅里发的全是几小时前的快照。
+  //
+  // 实测后果：池里 300 个成员没有一个在 30 分钟内成功过，位置 50 之后
+  // 可用率 0%。那不是排序问题，是这份状态早就不代表现实了。
+  //
+  // 30 分钟是与 DEGRADED 对齐的值，语义也顺：健康节点半小时确认一次。
+  // 负载上 820 个 HEALTHY / 30 分钟 ≈ 每分钟 27 个，而 HEALTHY 的保底
+  // 份额是每分钟约 56 个，到期即可探，不会积压。
+  HEALTHY: 30,
   // 隔离是人工决定的，低频复查只为了给人一个"它其实好了"的提示
   QUARANTINED: 720,
   // 人工否决与撤销：不再消耗探测预算
@@ -193,9 +204,18 @@ const STALE_JOB_MINUTES = 10;
  *
  * 实测就是这么停的：任务 46506903 停在 PENDING、completed 25/120，
  * 之后 8 分钟里 healthy / pending / total 三个数字一个都没动。
+ *
+ * 第二次踩同一个坑，形态更隐蔽：任务是 `PENDING` 且 `started_at` **为 NULL**
+ * （建了但一次都没被认领）。旧条件写的是 `started_at IS NULL OR ...` ——
+ * 把"还没开始"当成"刚刚开始"，于是它永远算活跃、永远挡着入队；而回收
+ * 那边要求 `started_at IS NOT NULL`，又永远碰不到它。两边合起来是一个
+ * 永久死锁：探测停摆 96 分钟，日志每 15 秒一行「探测暂停」，没有任何报错。
+ *
+ * 所以时间基准必须是 `COALESCE(started_at, created_at)`：没被认领的任务
+ * 用创建时间衡量年龄。回收与闸门都拿它跟同一个阈值比较，两处才真正同口径。
  */
 export const ACTIVE_JOB_PREDICATE = `status IN ('PENDING','RUNNING')
-       AND (started_at IS NULL OR started_at > now() - interval '${STALE_JOB_MINUTES} minutes')`;
+       AND COALESCE(started_at, created_at) > now() - interval '${STALE_JOB_MINUTES} minutes'`;
 
 /**
  * 回收僵死任务。
@@ -222,8 +242,7 @@ export async function reclaimStaleJobs(): Promise<number> {
          lease_expires_at = NULL,
          finished_at = now()
      WHERE status IN ('PENDING','RUNNING')
-       AND started_at IS NOT NULL
-       AND started_at < now() - interval '${STALE_JOB_MINUTES} minutes'`,
+       AND COALESCE(started_at, created_at) < now() - interval '${STALE_JOB_MINUTES} minutes'`,
   );
 }
 

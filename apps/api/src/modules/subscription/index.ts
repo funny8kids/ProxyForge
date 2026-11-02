@@ -772,10 +772,26 @@ async function loadExportProxies(
      FROM v_subscription_eligible_endpoints v
      JOIN resource_pool_members m ON m.endpoint_id = v.id AND m.pool_id = $1 AND m.suppressed = false
      WHERE v.trust_tier::text = ANY($2::text[])
-     -- 能开隧道的排前面：订阅里的顺序就是用户在 Clash 里看到的顺序，
-     -- 也是 fallback / url-test 分组的初始优先序。只按质量分排会让
-     -- "只能上明文 HTTP"的节点混在前面 —— 实测存活节点里 60% 是这种。
-     ORDER BY v.connect_ok DESC NULLS LAST, v.quality_score DESC, v.p50_ms ASC NULLS LAST
+     -- 订阅里的顺序就是用户在 Clash 里看到的顺序，也是 url-test 分组的
+     -- 初始优先序，所以排序要按「现在大概率能用」而不是「历史上分数高」。
+     --
+     -- 三档排序，从粗到细：
+     --   1. connect_ok —— 能开隧道。只按质量分排会让"只能上明文 HTTP"的
+     --      节点混在前面，实测存活节点里 60% 是这种。
+     --   2. 新鲜度分档 —— 免费代理几十分钟就死一轮，两小时前确认可用的
+     --      节点和十分钟前确认的，可靠性差一个量级。这里分档而不是直接
+     --      按 last_success_at 排：时间戳精确到毫秒，直接排会让质量分
+     --      彻底失效（同一批探测的节点也会因为毫秒差被打散）。
+     --   3. 档内按质量分与延迟 —— 新鲜度相同时，好节点仍然要排前面。
+     ORDER BY v.connect_ok DESC NULLS LAST,
+              CASE
+                WHEN v.last_success_at > now() - interval '10 minutes' THEN 0
+                WHEN v.last_success_at > now() - interval '30 minutes' THEN 1
+                WHEN v.last_success_at > now() - interval '2 hours'    THEN 2
+                ELSE 3
+              END ASC,
+              v.quality_score DESC,
+              v.p50_ms ASC NULLS LAST
      LIMIT 500`,
     [poolId, pool?.allowed_tiers ?? []],
   );

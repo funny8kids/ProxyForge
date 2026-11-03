@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-label="ProxyForge 架构：发现 → 候选隔离 → 验证 → 资源池 → 策略编译 → 网关 → 消费方">
+  <defs>
+    <linearGradient id="abg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1018"/>
+      <stop offset="1" stop-color="#080B12"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8B7CFF"/>
+      <stop offset="1" stop-color="#36D6C3"/>
+    </linearGradient>
+    <radialGradient id="ag1" cx="0.08" cy="0.1" r="0.45">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#8B7CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ag2" cx="0.94" cy="0.9" r="0.4">
+      <stop offset="0" stop-color="#36D6C3" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#36D6C3" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#9AA5B8"/>
+    </marker>
+    <marker id="arwc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#36D6C3"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" fill="url(#abg)"/>
+  <rect width="1200" height="420" fill="url(#ag1)"/>
+  <rect width="1200" height="420" fill="url(#ag2)"/>
+  <rect x="0.5" y="0.5" width="1199" height="419" fill="none" stroke="#8B7CFF" stroke-opacity="0.14"/>
+
+  <!-- 主链路箭头 -->
+  <g stroke="#9AA5B8" stroke-opacity="0.72" stroke-width="1.5" marker-end="url(#arw)">
+    <line x1="172" y1="165" x2="197" y2="165"/>
+    <line x1="332" y1="165" x2="357" y2="165"/>
+    <line x1="492" y1="165" x2="517" y2="165"/>
+    <line x1="652" y1="165" x2="677" y2="165"/>
+    <line x1="812" y1="165" x2="837" y2="165"/>
+    <line x1="972" y1="165" x2="997" y2="165"/>
+  </g>
+
+  <!-- 01 资源发现 -->
+  <g>
+    <rect x="40" y="110" width="130" height="110" rx="9" fill="#121A29" stroke="#8B7CFF" stroke-opacity="0.42"/>
+    <text x="52" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#5B5478">01</text>
+    <text x="105" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">资源发现</text>
+    <text x="105" y="182" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#7A86A0">19 个公开源</text>
+    <text x="105" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#7A86A0">手动导入 / API</text>
+  </g>
+
+  <!-- 02 候选隔离区 -->
+  <g>
+    <rect x="200" y="110" width="130" height="110" rx="9" fill="#191428" stroke="#8B7CFF" stroke-opacity="0.62"/>
+    <text x="212" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#6B5FA0">02</text>
+    <text x="265" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">候选隔离区</text>
+    <text x="265" y="182" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#9C8FD8">解析器与 AI</text>
+    <text x="265" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#9C8FD8">只能写这里</text>
+  </g>
+
+  <!-- 03 验证引擎 -->
+  <g>
+    <rect x="360" y="110" width="130" height="110" rx="9" fill="#1B1733" stroke="#9A8BFB" stroke-opacity="0.62"/>
+    <text x="372" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#6B5FA0">03</text>
+    <text x="425" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">验证引擎</text>
+    <text x="425" y="182" text-anchor="middle" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10.5" fill="#A99BFF">L1 – L6</text>
+    <text x="425" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#9C8FD8">分层探测</text>
+  </g>
+
+  <!-- 04 资源池 -->
+  <g>
+    <rect x="520" y="110" width="130" height="110" rx="9" fill="#0F2430" stroke="#4ACDD1" stroke-opacity="0.55"/>
+    <text x="532" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#3E7A85">04</text>
+    <text x="585" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">资源池</text>
+    <text x="585" y="182" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#8FD8DA">健康态驱动</text>
+    <text x="585" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#8FD8DA">自动重算</text>
+  </g>
+
+  <!-- 05 策略编译 -->
+  <g>
+    <rect x="680" y="110" width="130" height="110" rx="9" fill="#0F2430" stroke="#4ACDD1" stroke-opacity="0.55"/>
+    <text x="692" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#3E7A85">05</text>
+    <text x="745" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">策略编译</text>
+    <text x="745" y="182" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#8FD8DA">版本 · 哈希</text>
+    <text x="745" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#8FD8DA">回滚</text>
+  </g>
+
+  <!-- 06 网关 -->
+  <g>
+    <rect x="840" y="110" width="130" height="110" rx="9" fill="#0D1F26" stroke="#36D6C3" stroke-opacity="0.42"/>
+    <text x="852" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#3E7A85">06</text>
+    <text x="905" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">网关 gost</text>
+    <text x="905" y="182" text-anchor="middle" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10.5" fill="#7FE7E1">HTTP · SOCKS5</text>
+    <text x="905" y="198" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#6FB9B6">仅监听回环</text>
+  </g>
+
+  <!-- 07 消费方 -->
+  <g>
+    <rect x="1000" y="110" width="130" height="110" rx="9" fill="#121A29" stroke="#36D6C3" stroke-opacity="0.55"/>
+    <text x="1012" y="132" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="9" letter-spacing="1.4" fill="#3E7A85">07</text>
+    <text x="1065" y="160" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#E8EDF7">消费方</text>
+    <text x="1065" y="182" text-anchor="middle" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10.5" fill="#7FE7E1">Clash · sing-box</text>
+    <text x="1065" y="198" text-anchor="middle" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10.5" fill="#7FE7E1">v2rayN</text>
+  </g>
+
+  <!-- 晋级门槛标注 -->
+  <g>
+    <text x="265" y="252" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10" fill="#6B5FA0">人工晋级 + 授权声明</text>
+    <text x="265" y="268" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10" fill="#4A5464">唯一入口 · 写审计</text>
+  </g>
+
+  <!-- 订阅旁路 -->
+  <path d="M585 220 L585 288 L1065 288 L1065 224"
+        fill="none" stroke="#36D6C3" stroke-opacity="0.5" stroke-width="1.3"
+        stroke-dasharray="5 4" marker-end="url(#arwc)"/>
+  <rect x="640" y="300" width="380" height="26" rx="13" fill="#0B1018" stroke="#36D6C3" stroke-opacity="0.16"/>
+  <text x="830" y="318" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="11" fill="#7FE7E1">签名订阅 · 四种格式 · Ed25519 over JCS</text>
+
+  <!-- 底部注记 -->
+  <text x="40" y="378" font-family="'PingFang SC','Microsoft YaHei',sans-serif" font-size="10.5" fill="#4A5464">
+    候选区 → 端点表的唯一入口是「人工晋级」，且必须携带授权声明；公开代理即使健康也不会进入正式配置。
+  </text>
+</svg>

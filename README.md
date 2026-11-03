@@ -121,42 +121,8 @@ ProxyForge **不是**另一个 Clash 客户端，也**不是**免费 IP 列表�
 
 模块化单体：模块边界即未来的服务边界，拆分不需要重写。
 
-```mermaid
-flowchart LR
-    subgraph discovery["资源发现"]
-        A1["公开列表 · 19 个源"]
-        A2["手动导入 / API"]
-    end
+<img src="docs/architecture.svg" width="100%" alt="架构：资源发现 → 候选隔离区 → 验证引擎 → 资源池 → 策略编译 → 网关 → 消费方">
 
-    subgraph control["控制平面"]
-        B1["候选隔离区<br/>candidate_endpoints"]
-        B2["验证引擎<br/>L1–L6 分层探测"]
-        B3["资源池<br/>规则 + 手动成员"]
-        B4["策略编译<br/>版本 / 哈希 / 回滚"]
-    end
-
-    subgraph data["数据平面"]
-        C1["gost 实例<br/>HTTP / SOCKS5"]
-    end
-
-    subgraph consume["消费方"]
-        D1["Clash · FlClash<br/>sing-box · v2rayN"]
-        D2["应用直连"]
-    end
-
-    A1 --> B1
-    A2 --> B1
-    B1 -->|"人工晋级<br/>+ 授权声明"| B2
-    B2 -->|"HEALTHY"| B3
-    B3 --> B4
-    B4 --> C1
-    B3 -->|"签名订阅 · 4 种格式"| D1
-    C1 --> D2
-
-    style B1 fill:#2d2438,stroke:#a78bfa,color:#e8edf7
-    style B3 fill:#1a2b33,stroke:#22d3ee,color:#e8edf7
-    style B4 fill:#1a2b33,stroke:#22d3ee,color:#e8edf7
-```
 
 **五条不变量**（写在代码里，不是文档里）：
 

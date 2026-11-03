@@ -394,8 +394,12 @@ export function KV({ k, v }: { k: string; v: ReactNode }): JSX.Element {
 }
 
 export function Skeleton({ rows = 4 }: { rows?: number }): JSX.Element {
+  // `data-skeleton` 是给截图回归用的钩子。
+  // 之前 shots.mjs 的「渲染就绪」判据只看面板高度 > 120px，
+  // 而骨架屏本身就超过 120px —— 于是「数据还没到」和「数据为空」都算通过，
+  // 截出来的图是四个 0 加五条灰条，断言全绿。判据必须能区分这两种情况。
   return (
-    <div style={{ padding: '16px 20px', display: 'grid', gap: 10 }}>
+    <div data-skeleton="" style={{ padding: '16px 20px', display: 'grid', gap: 10 }}>
       {Array.from({ length: rows }, (_, i) => (
         <div
           key={i}

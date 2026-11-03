@@ -106,7 +106,18 @@ for (const id of SCREENS) {
   await page.goto(`${BASE}/#/${id}`, { waitUntil: 'networkidle' });
   // 等数据落地：面板出现且高度稳定
   await page.waitForSelector('.content .panel, .content .empty, .content .note', { timeout: 15000 });
-  await page.waitForTimeout(450);
+  // 等骨架屏消失 —— 否则截到的是「四个 0 + 五条灰条」，
+  // 而高度断言照样通过（骨架屏自己就比 120px 高）。这是本脚本之前漏掉的一类假绿。
+  await page
+    .waitForFunction(() => document.querySelectorAll('[data-skeleton]').length === 0, { timeout: 15000 })
+    .catch(() => problems.push(`${id}: 骨架屏 15s 内未消失（数据没加载出来）`));
+  // 再等一轮网络空闲：同一屏往往并发取多个接口，而 PGlite 是单线程串行执行，
+  // 慢的那个（sources 列表 3.4s）会把快的那个（stats 0.5s）堵在后面。
+  // 只等骨架屏消失会截到「列表已出、统计卡还是 0」的半成品。
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  // 固定再等一拍：PGlite 单线程下同一屏的多个接口是排队执行的，
+  // networkidle 有可能在「前一个请求刚结束、后一个还没发出去」的空隙里就满足了。
+  await page.waitForTimeout(1200);
 
   const probe = await page.evaluate(() => {
     const content = document.querySelector('.content');

@@ -169,6 +169,94 @@ await check('同一 IP 已被别的源晋级过 → 候选标 DUPLICATE，不再
   assert.equal(n[0]?.n, 1, '同一个 IP 在端点表里只能有一行');
 });
 
+console.log('\n[4] 判死的端点被重新列出时重获一次探测机会');
+
+/** 直接建一个已判死的端点，`lastCheckMinutes` 控制它上次被探测的时间。 */
+async function mkRejectedEndpoint(
+  sourceId: string,
+  host: string,
+  lastCheckMinutes: number,
+): Promise<string> {
+  const id = randomUUID();
+  await exec(
+    `INSERT INTO proxy_endpoints
+       (id, source_id, protocol, host, port, origin_type, authorization_status, trust_tier,
+        lifecycle_status, dedupe_key, display_name)
+     VALUES ($1,$2,'SOCKS5',$3,1080,'PUBLIC_PROXY','RESTRICTED','PUBLIC_PROXY',
+             'REJECTED',$4,$5)`,
+    [id, sourceId, host, `dk-${host}`, `${host}:1080`],
+  );
+  await exec(
+    `INSERT INTO endpoint_health_state (endpoint_id, last_check_at, consecutive_failures)
+     VALUES ($1, now() - ($2 || ' minutes')::interval, 2)`,
+    [id, String(lastCheckMinutes)],
+  );
+  return id;
+}
+
+async function lifecycleOf(id: string): Promise<string> {
+  const row = await q<{ s: string }>(
+    `SELECT lifecycle_status::text AS s FROM proxy_endpoints WHERE id = $1`,
+    [id],
+  );
+  return row[0]?.s ?? 'MISSING';
+}
+
+await check('判死 13 小时后源站重新列出 → 复活为待验证，而不是永久丢弃', async () => {
+  // 实测（2026-11）：87,897 条被判 DUPLICATE 的候选里 77,037 条的对应端点是
+  // REJECTED，那些端点上一次被探测的中位时间是 13 小时前。而 REJECTED 在调度
+  // 表里是 null 间隔（永不重测）—— 等于源站把同一个地址重新列一百次也没用。
+  const srcA = await mkSource('revive-src-a');
+  const srcB = await mkSource('revive-src-b');
+  const epId = await mkRejectedEndpoint(srcA, '10.4.0.1', 13 * 60);
+
+  await mkCandidate(srcB, '10.4.0.1', 1);
+  const r = await tx((t) => promoteCandidates(t, srcB, 'RESTRICTED', 10));
+
+  assert.equal(r.promoted, 0, '不该新建端点');
+  assert.equal(r.duplicate, 1, '候选本身仍算重复');
+  assert.equal(r.revived, 1, '应该复活一次');
+  assert.equal(
+    await lifecycleOf(epId),
+    'PENDING_VERIFICATION',
+    'REJECTED 必须回到待验证，否则永远进不了探测队列',
+  );
+
+  // 溯源要补：漏了它，新列出的那个源永远拿不到这份产出的 credit
+  const prov = await q<{ n: number }>(
+    `SELECT count(*)::int AS n FROM endpoint_sources WHERE endpoint_id = $1 AND source_id = $2`,
+    [epId, srcB],
+  );
+  assert.equal(prov[0]?.n, 1, '复活时必须补写 endpoint_sources');
+});
+
+await check('刚探过不久的判死端点不复活（防止列表陈旧导致无限循环）', async () => {
+  // 源站列表里常有一批早已失效的地址被反复列出。没有这个防抖，
+  // 一个真死的地址会被「重新列出 → 复活 → 探测失败 → 判死」无限循环。
+  const srcA = await mkSource('debounce-src-a');
+  const srcB = await mkSource('debounce-src-b');
+  const epId = await mkRejectedEndpoint(srcA, '10.5.0.1', 10); // 10 分钟前才探过
+
+  await mkCandidate(srcB, '10.5.0.1', 1);
+  const r = await tx((t) => promoteCandidates(t, srcB, 'RESTRICTED', 10));
+
+  assert.equal(r.revived, 0, '刚探过的端点不该被复活');
+  assert.equal(await lifecycleOf(epId), 'REJECTED');
+});
+
+await check('已在复探周期里的 UNAVAILABLE 不复活（它本来就会被重探）', async () => {
+  const srcA = await mkSource('unavail-src-a');
+  const srcB = await mkSource('unavail-src-b');
+  const epId = await mkRejectedEndpoint(srcA, '10.6.0.1', 13 * 60);
+  await exec(`UPDATE proxy_endpoints SET lifecycle_status = 'UNAVAILABLE' WHERE id = $1`, [epId]);
+
+  await mkCandidate(srcB, '10.6.0.1', 1);
+  const r = await tx((t) => promoteCandidates(t, srcB, 'RESTRICTED', 10));
+
+  assert.equal(r.revived, 0);
+  assert.equal(await lifecycleOf(epId), 'UNAVAILABLE', 'UNAVAILABLE 有自己的 120 分钟节奏，不该被插队');
+});
+
 await closeDb();
 console.log(`\n${fail === 0 ? '全部通过' : '有失败项'}：${pass} 通过 / ${fail} 失败\n`);
 process.exit(fail === 0 ? 0 : 1);

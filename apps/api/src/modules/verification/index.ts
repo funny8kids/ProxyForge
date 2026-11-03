@@ -10,6 +10,8 @@ import { actorOf, guard } from '../auth/index.js';
 import { audit, emit, EVENT_TYPES } from '../../shared/events.js';
 import { invalid, notFound } from '../../shared/errors.js';
 import { uuidv7 } from '../../shared/id.js';
+// 只依赖 db/client，不会和 schedule.ts 形成循环
+import { noteProbeDbCost, probeBatchCap } from './schedule.js';
 import { open } from '../../shared/crypto.js';
 import { probe, qualityScore, type ProbeResult } from './probe.js';
 import { linkExitGeography } from './geo.js';
@@ -304,10 +306,16 @@ export async function runVerificationJob(jobId: string): Promise<void> {
   // 小批次（测试、手工单点探测）不打分段日志，否则把测试输出淹掉
   if (completed >= 100) {
     const wall = performance.now() - t0;
+    const msPerItem = dbMsSum / Math.max(completed, 1);
+    // 回报给调度器：下一批的额度由「每条落库成本」反推（见 schedule.ts 的
+    // DB_BUDGET_MS）。不回填的话批次会一路涨到把事件循环占满，
+    // 表现就是探测大面积假失败、HEALTHY 单调下滑。
+    noteProbeDbCost(msPerItem);
     console.log(
       `[worker] 探测分段 ${jobId.slice(0, 8)}：${completed} 个 / 墙钟 ${Math.round(wall)}ms` +
         ` · 探测累计 ${Math.round(probeMsSum / 1000)}s（÷${concurrency} 并发 ≈ ${Math.round(probeMsSum / concurrency)}ms）` +
-        ` · 落库累计 ${Math.round(dbMsSum)}ms（${Math.round((dbMsSum / Math.max(completed, 1)) * 10) / 10}ms/条）`,
+        ` · 落库累计 ${Math.round(dbMsSum)}ms（${Math.round(msPerItem * 10) / 10}ms/条）` +
+        ` · 下一批额度 ${Number.isFinite(probeBatchCap()) ? probeBatchCap() : '不限'}`,
     );
   }
 }

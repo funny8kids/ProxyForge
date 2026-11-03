@@ -133,6 +133,55 @@ const TIER_VALUES = TIER_PLAN.map((t) => {
  */
 const DEFAULT_BATCH = Number(process.env.PF_PROBE_BATCH ?? 120);
 
+/**
+ * 批次真正的上限：**单线程库能吸收多少**，而不是「有多少供给」。
+ *
+ * 这个约束是被实测逼出来的。PGlite 是单线程 WASM，每次 `t.query()` 都同步
+ * 阻塞事件循环，所以落库耗时直接等于事件循环被占用的时长。而探测的响应读取
+ * 也跑在同一个事件循环上 —— 落库占得越久，探测读到半截响应就超时，被判成
+ * `PROTOCOL_ERROR`（`readUntil` 超时后只是把已读到的部分返回，上层看到响应
+ * 不完整就归为协议错误，本质是**伪装成协议错误的超时**）。
+ *
+ * 实测（2026-11）：
+ *   · 批次 122 → 落库 1.7s / 墙钟 7s  ≈ 24% 占用，HEALTHY 稳定
+ *   · 批次 1063 → 落库 14.7s / 墙钟 55s ≈ 27% 占用，HEALTHY 12 分钟掉 100 个
+ *
+ * 停机复核那批"刚被降级"的端点，**73%（29/40）在空闲条件下仍然存活** ——
+ * 判决站不住脚。把批次压回 400（占用 16%）后 HEALTHY 立刻转为上升
+ * （920 → 949 / 6 分钟）。因果链确认。
+ *
+ * 所以这里不再把 `PF_PROBE_BATCH` 当成硬额度，而是当成**上限**，
+ * 实际额度由「每批实测的 ms/条」反推：预算 ÷ 单条成本。
+ * 这样表变大、单条成本上升时，批次会自动收缩，而不是等到 HEALTHY 开始掉
+ * 才有人去查。
+ */
+const DB_BUDGET_MS = Number(process.env.PF_PROBE_DB_BUDGET_MS ?? 5000);
+
+/** 再紧也不能低于这个数：批次太小会让每轮的固定开销（回收、查询规划）摊不薄 */
+const MIN_BATCH = 120;
+
+/**
+ * 每条落库耗时的指数移动平均。
+ *
+ * 用 EMA 而不是"取上一批"：单批会因为分区路由、WAL checkpoint 之类的偶发
+ * 因素抖动，直接反馈会把批次搞得忽大忽小。
+ */
+let dbMsPerItemEma = 0;
+
+/** 探测 worker 每批结束后回报实测的「每条落库耗时」。 */
+export function noteProbeDbCost(msPerItem: number): void {
+  if (!Number.isFinite(msPerItem) || msPerItem <= 0) return;
+  dbMsPerItemEma = dbMsPerItemEma === 0
+    ? msPerItem
+    : dbMsPerItemEma * 0.7 + msPerItem * 0.3;
+}
+
+/** 当前生效的批次上限（未测到成本前不设限，让首批按配置跑）。 */
+export function probeBatchCap(): number {
+  if (dbMsPerItemEma <= 0) return Number.POSITIVE_INFINITY;
+  return Math.max(MIN_BATCH, Math.floor(DB_BUDGET_MS / dbMsPerItemEma));
+}
+
 export interface EnqueueResult {
   jobId: string | null;
   picked: number;
@@ -267,6 +316,9 @@ export async function reclaimStaleJobs(): Promise<number> {
 }
 
 export async function enqueueDueProbes(batch = DEFAULT_BATCH): Promise<EnqueueResult> {
+  // 把「配置额度」和「库能吸收的额度」取小 —— 见 DB_BUDGET_MS 的注释。
+  batch = Math.min(batch, probeBatchCap());
+
   // 先回收僵死任务，再判断"是否已有任务在跑" —— 顺序反了，
   // 一个刚过期的任务会让这一轮直接放弃入队。
   await reclaimStaleJobs();

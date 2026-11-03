@@ -90,6 +90,8 @@ export interface IngestResult {
   synced: number;
   /** 本轮晋级出的端点数 */
   promoted: number;
+  /** 本轮因「源站重新列出」而重获探测机会的已判死端点数 */
+  revived: number;
   /** 当前健康 + 降级的公开代理数（决定是否继续晋级） */
   healthyPublic: number;
   /** 当前还在等第一次探测结论的端点数 */
@@ -260,6 +262,7 @@ export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestR
   const healthyPublic = await countHealthyPublic();
   const awaitingProbe = await countAwaitingProbe();
   let promotedTotal = 0;
+  let revivedTotal = 0;
   let promotionPaused = false;
   let pauseReason: IngestResult['pauseReason'] = null;
 
@@ -299,6 +302,7 @@ export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestR
       );
       remaining -= r.promoted;
       promotedTotal += r.promoted;
+      revivedTotal += r.revived;
 
       const existing = items.find((i) => i.key === source.key);
       if (existing) {
@@ -323,9 +327,14 @@ export async function runIngestCycle(limit = SOURCES_PER_CYCLE): Promise<IngestR
     }
   }
 
+  if (revivedTotal > 0) {
+    console.log(`[worker] 复活 ${revivedTotal} 个已判死端点（源站重新列出，重获一次探测机会）`);
+  }
+
   return {
     synced: sources.length,
     promoted: promotedTotal,
+    revived: revivedTotal,
     healthyPublic,
     awaitingProbe,
     promotionPaused,

@@ -19,8 +19,23 @@ export type PromoteAuthorization = 'AUTHORIZED' | 'RESTRICTED';
 export interface PromoteResult {
   promoted: number;
   duplicate: number;
+  /** 被判死之后又被源站重新列出、因而重获探测机会的端点数 */
+  revived: number;
   remaining: number;
 }
+
+/**
+ * 被判死的端点，隔多久才允许因「源站重新列出」而复活一次。
+ *
+ * 这个间隔不是调优参数，是**防抖**：源站列表里常有一批早已失效的地址被
+ * 反复列出（列表本身没更新）。没有它，一个真死的地址会被「重新列出 →
+ * 复活 → 探测失败 → 判死」无限循环，每轮烧一次探测预算。
+ *
+ * 2 小时的依据：免费代理的存活期是几十分钟量级，两小时足够让「上一轮探测
+ * 恰好在它掉线时命中」这种偶发误判翻篇；同时又比 UNAVAILABLE 的 120 分钟
+ * 复探周期短，不至于比常规复探还慢。
+ */
+const REVIVE_AFTER_HOURS = Number(process.env.PF_REVIVE_REJECTED_HOURS ?? 2);
 
 export async function promoteCandidates(
   t: TxLike,
@@ -74,24 +89,68 @@ export async function promoteCandidates(
        WHERE source_id = $1 AND review_status = 'PENDING' AND stale_at IS NULL`,
       [sourceId],
     );
-    return { promoted: 0, duplicate: 0, remaining: rest?.n ?? 0 };
+    return { promoted: 0, duplicate: 0, revived: 0, remaining: rest?.n ?? 0 };
   }
 
-  // 已存在的端点先查一遍，避免逐条 SELECT
+  /**
+   * 已存在的端点先查一遍，避免逐条 SELECT。
+   *
+   * 除了 dedupe_key，还要取**生命周期状态和上次探测时间** —— 因为「已存在」
+   * 不等于「还该被忽略」。原来只查 dedupe_key 是否存在，于是被判死的端点
+   * 会永久锁死自己 host:port 的重测资格：源站明明又重新把它列出来了
+   * （这是「它现在是活的」的新证据），我们却拿几小时前的结论把它丢掉。
+   *
+   * 实测（2026-11）：87,897 条被判 DUPLICATE 的候选里，**77,037 条的对应端点
+   * 是 REJECTED**，那些端点上一次被探测的中位时间是 **13 小时前**。
+   * 而 REJECTED 在调度表里是 null 间隔，等于永不重测 —— 这条路径一封死，
+   * 就算源站把同一个地址重新列一百次也不会有任何反应。
+   */
   const keys = pending.map((c) => c.dedupe_key).filter((k): k is string => !!k);
   const existing = keys.length
-    ? await t.q<{ dedupe_key: string }>(
-        'SELECT dedupe_key FROM proxy_endpoints WHERE dedupe_key = ANY($1::text[])',
-        [keys],
+    ? await t.q<{
+        dedupe_key: string; id: string; lifecycle_status: string; stale: boolean;
+      }>(
+        `SELECT e.dedupe_key, e.id, e.lifecycle_status::text AS lifecycle_status,
+                COALESCE(hs.last_check_at < now() - ($2 || ' hours')::interval, true) AS stale
+         FROM proxy_endpoints e
+         LEFT JOIN endpoint_health_state hs ON hs.endpoint_id = e.id
+         WHERE e.dedupe_key = ANY($1::text[]) AND e.deleted_at IS NULL`,
+        [keys, String(REVIVE_AFTER_HOURS)],
       )
     : [];
-  const existingSet = new Set(existing.map((e) => e.dedupe_key));
+  const existingSet = new Map(existing.map((e) => [e.dedupe_key, e]));
 
   let promoted = 0;
   let duplicate = 0;
+  let revived = 0;
 
   for (const c of pending) {
-    if (c.dedupe_key && existingSet.has(c.dedupe_key)) {
+    const dup = c.dedupe_key ? existingSet.get(c.dedupe_key) : undefined;
+    if (dup) {
+      /**
+       * 判死的端点被源站重新列出 —— 复活一次，让它重新排队探测。
+       *
+       * 只复活 REJECTED：UNAVAILABLE 本来就在 120 分钟复探周期里，
+       * 再插一次队只会打乱它自己的节奏，收益是零。
+       */
+      if (dup.lifecycle_status === 'REJECTED' && dup.stale) {
+        await t.exec(
+          `UPDATE proxy_endpoints SET lifecycle_status = 'PENDING_VERIFICATION'
+           WHERE id = $1 AND lifecycle_status = 'REJECTED'`,
+          [dup.id],
+        );
+        // 溯源要补：质量评分按 endpoint_sources 聚合，漏了这一步
+        // 新列出的那个源就永远拿不到这份「产出」的credit。
+        await t.exec(
+          `INSERT INTO endpoint_sources (endpoint_id, source_id) VALUES ($1,$2)
+           ON CONFLICT DO NOTHING`,
+          [dup.id, sourceId],
+        );
+        // 复活后它已不再是「已知死亡」，同批次里后续的同 key 候选不该再触发一次。
+        dup.lifecycle_status = 'PENDING_VERIFICATION';
+        revived += 1;
+      }
+
       await t.exec(
         `UPDATE candidate_endpoints SET review_status = 'DUPLICATE', reviewed_at = now() WHERE id = $1`,
         [c.id],
@@ -127,7 +186,12 @@ export async function promoteCandidates(
     );
     // 同批次里跨源重复的同一条代理，也要拦住 —— 否则两个源各推一次
     // 就会在端点表里建出两行 dedupe_key 相同的记录（没有唯一约束兜底）。
-    if (c.dedupe_key) existingSet.add(c.dedupe_key);
+    if (c.dedupe_key) {
+      existingSet.set(c.dedupe_key, {
+        dedupe_key: c.dedupe_key, id: endpointId,
+        lifecycle_status: 'PENDING_VERIFICATION', stale: false,
+      });
+    }
     promoted += 1;
   }
 
@@ -137,7 +201,7 @@ export async function promoteCandidates(
     [sourceId],
   );
 
-  return { promoted, duplicate, remaining: rest?.n ?? 0 };
+  return { promoted, duplicate, revived, remaining: rest?.n ?? 0 };
 }
 
 /**

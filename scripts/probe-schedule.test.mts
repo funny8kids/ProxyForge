@@ -16,7 +16,8 @@ process.env.DATABASE_URL ??= 'memory://';
 
 const { closeDb, exec, getDb, q1 } = await import('../apps/api/src/db/client.js');
 const { migrate } = await import('../apps/api/src/db/migrate.js');
-const { enqueueDueProbes, scheduleBacklog } = await import('../apps/api/src/modules/verification/schedule.js');
+const { enqueueDueProbes, scheduleBacklog, noteProbeDbCost, probeBatchCap } =
+  await import('../apps/api/src/modules/verification/schedule.js');
 
 let pass = 0;
 let fail = 0;
@@ -536,6 +537,49 @@ await check('scheduleBacklog 要把 REJECTED / REVOKED 的总数算进去（到�
   assert.ok((revoked?.total ?? 0) >= 2, `REVOKED total 应 ≥2，实际 ${revoked?.total}`);
   assert.equal(rejected?.due, 0, '永不探测的档位到期数必须是 0');
   assert.equal(revoked?.due, 0);
+});
+
+await check('批次额度由「每条落库成本」反推，而不是照着供给放大', async () => {
+  // 实测（2026-11）：批次 1063 时落库 14.7s / 墙钟 55s ≈ 27% 事件循环占用，
+  // HEALTHY 12 分钟掉 100 个；停机复核那批刚被降级的端点，73%（29/40）
+  // 在空闲条件下仍然存活 —— 判决站不住脚，是事件循环被落库占满导致
+  // 探测读到半截响应就超时（`readUntil` 超时只返回已读部分，上层归为
+  // PROTOCOL_ERROR，本质是伪装成协议错误的超时）。
+  // 把批次压到 400（占用 16%）后 HEALTHY 立刻转为上升（920 → 949 / 6 分钟）。
+  const before = probeBatchCap();
+  assert.equal(before, Number.POSITIVE_INFINITY, '还没测到成本之前不该设限');
+
+  // 13ms/条 × 400 ≈ 5.2s，正是实测里"能稳住"的那一档
+  noteProbeDbCost(13);
+  const cap = probeBatchCap();
+  assert.ok(cap >= 300 && cap <= 500, `13ms/条 时额度应在 300–500，实际 ${cap}`);
+
+  // 表变大、单条变贵 → 额度必须自动收缩，而不是等 HEALTHY 开始掉才发现
+  noteProbeDbCost(40);
+  noteProbeDbCost(40);
+  assert.ok(probeBatchCap() < cap, '单条成本上升后额度必须下降');
+
+  // 再贵也不能低于地板：批次太小，每轮的固定开销摊不薄
+  noteProbeDbCost(100000);
+  assert.ok(probeBatchCap() >= 120, '额度有下限，不能被压到 0');
+});
+
+await check('enqueueDueProbes 实际按额度取数，配置值只是上限', async () => {
+  await settleAllEndpoints();
+  for (let i = 0; i < 300; i += 1) await mkEndpoint('PENDING_VERIFICATION', null);
+
+  // 让额度落到 200 附近
+  noteProbeDbCost(25);
+  const cap = probeBatchCap();
+  const r = await enqueueDueProbes(5000);
+  assert.ok(r.jobId, '应该入队');
+  const picked = (await jobEndpointIds(r.jobId!)).length;
+  assert.ok(
+    picked <= cap,
+    `配置 5000 但额度只有 ${cap}，实际取了 ${picked} —— 说明额度没生效`,
+  );
+  assert.ok(picked >= 120, `不该少到地板以下，实际 ${picked}`);
+  await clearSchedulerJobs();
 });
 
 await closeDb();

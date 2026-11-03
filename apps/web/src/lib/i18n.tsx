@@ -55,7 +55,8 @@ const ZH: Record<string, string> = {
   'Trust tiers': '信任分级',
   'Protocol mix': '协议分布',
   'Origin mix': '来源分布',
-  'Quality trend': '质量趋势',
+  'Success rate trend': '成功率趋势',
+  'daily probe success rate': '日探测成功率',
   'Top endpoints': '优质端点',
   'Gateway traffic': '网关流量',
   'Gateway eligible': '可进网关',
@@ -174,7 +175,6 @@ const ZH: Record<string, string> = {
   Warnings: '警告',
   'One policy = one listen port. Members are frozen at compile time — the data plane never calls back.':
     '一个策略对应一个监听端口，成员在编译期固化——数据面请求期绝不回源。',
-  'avg quality score': '平均质量分',
   days: '天',
   // 信任
   'Gateway eligible only': '仅这两个分级可进网关',

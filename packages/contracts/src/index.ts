@@ -595,7 +595,16 @@ export interface OverviewAnalytics {
   tiers: Array<{ tier: TrustTier; count: number }>;
   protocolMix: Array<{ protocol: ProxyProtocol; count: number }>;
   originMix: Array<{ originType: OriginType; count: number }>;
-  qualityTrend: Array<{ day: string; avgQuality: number; checks: number; successRate: number }>;
+  /**
+   * 每日探测趋势。**只包含完整日**，且每个字段都来自 `health_checks` 里
+   * 不可变的原始记录 —— 不掺端点当前状态。
+   *
+   * 曾经这里叫 `avgQuality`，算法是「当天被探过的端点，它们的**现在**质量分均值」。
+   * 于是同一个历史日期会随着端点后来死掉而不断改写：11-02 那天重探了大批
+   * 已死端点，均值从 63 掉到 10，图上画出一条断崖 —— 而当天的事实没有变过。
+   * 历史桶里放当前状态，是这份数据模型里最容易犯的错。
+   */
+  qualityTrend: Array<{ day: string; checks: number; successRate: number; avgMs: number | null }>;
   regionDistribution: Array<{ countryCode: string; count: number; avgLatency: number | null }>;
   topEndpoints: Array<{
     id: string;

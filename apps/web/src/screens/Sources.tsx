@@ -251,8 +251,14 @@ export function Sources(): JSX.Element {
                           自动停用必须显式写在名字下面。只把 enabled 改成 false 的话，
                           这个源在列表里只是"变灰了"，和手动停用的源长得一模一样，
                           而人根本不知道自己没关过它。
+
+                          但必须**同时**要求 `off`：`auto_disabled_at` 是一次历史事件，
+                          源被人重新启用之后这个时间戳不会自己消失，
+                          于是列表里会出现「已被系统自动停用」+「上次同步 2 分钟前」
+                          这种自相矛盾的行 —— 而它其实正在正常工作。
+                          描述当前状态的话，判据就必须是当前状态。
                         */}
-                        {s.autoDisabledAt && (
+                        {off && s.autoDisabledAt && (
                           <div className="row-sub" style={{ color: 'var(--bad)' }} title={s.autoDisableReason ?? undefined}>
                             {t('auto-disabled')}
                             {s.autoDisableReason ? ` · ${s.autoDisableReason}` : ''}

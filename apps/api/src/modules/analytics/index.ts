@@ -33,15 +33,21 @@ export async function registerAnalyticsRoutes(app: FastifyInstance): Promise<voi
     // 质量趋势：按天聚合真实探测记录。
     // 排除「今天」这个未完成的桶——它只有零点到此刻的少量样本（实测 73 条 vs 全天 340 条），
     // 画在末尾会被读成质量断崖，而事实只是当天还没过完。日粒度曲线只应包含完整日。
-    const trend = await q<{ day: string; avg_quality: string | null; checks: string; succ: string }>(`
-      SELECT to_char(date_trunc('day', h.checked_at), 'YYYY-MM-DD') AS day,
-             round(avg(s.quality_score), 2)::text AS avg_quality,
+    //
+    // 而且只用 health_checks 里**不可变**的列（success / total_ms）。
+    // 早先这里取的是 `avg(endpoint_health_state.quality_score)` ——
+    // 那是端点**此刻**的分数，等于让后来的死亡去改写历史：
+    // 11-02 重探了大批已死端点，那一桶的均值从 63 掉到 10，
+    // 画出来是一条断崖，而当天的事实一次都没变过。
+    // 历史桶里只能放历史事实，这条和「connect_ok 不能当优先级」是同一条。
+    const trend = await q<{ day: string; checks: string; succ: string; avg_ms: string | null }>(`
+      SELECT to_char(date_trunc('day', checked_at), 'YYYY-MM-DD') AS day,
              count(*)::text AS checks,
-             count(*) FILTER (WHERE h.success)::text AS succ
-      FROM health_checks h
-      JOIN endpoint_health_state s ON s.endpoint_id = h.endpoint_id
-      WHERE h.checked_at >= now() - interval '30 days'
-        AND h.checked_at <  date_trunc('day', now())
+             count(*) FILTER (WHERE success)::text AS succ,
+             round(avg(total_ms) FILTER (WHERE success))::text AS avg_ms
+      FROM health_checks
+      WHERE checked_at >= now() - interval '30 days'
+        AND checked_at <  date_trunc('day', now())
       GROUP BY 1 ORDER BY 1
     `);
 
@@ -90,9 +96,9 @@ export async function registerAnalyticsRoutes(app: FastifyInstance): Promise<voi
       originMix: origins.map((o) => ({ originType: o.origin_type as never, count: Number(o.c) })),
       qualityTrend: trend.map((t) => ({
         day: t.day,
-        avgQuality: Number(t.avg_quality ?? 0),
         checks: Number(t.checks),
         successRate: Number(t.checks) > 0 ? Number(t.succ) / Number(t.checks) : 0,
+        avgMs: t.avg_ms === null ? null : Number(t.avg_ms),
       })),
       regionDistribution: regions.map((r) => ({
         countryCode: r.country_code,

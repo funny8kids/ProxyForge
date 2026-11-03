@@ -89,8 +89,8 @@ export function Overview(): JSX.Element {
 
       <div className="grid g-main" style={{ marginBottom: 16 }}>
         <Panel
-          title={t('Quality trend')}
-          sub={`${trend.length || '—'} ${t('days')} · ${t('avg quality score')}`}
+          title={t('Success rate trend')}
+          sub={`${trend.length || '—'} ${t('days')} · ${t('daily probe success rate')}`}
           fill
         >
           {loading ? (
@@ -98,9 +98,9 @@ export function Overview(): JSX.Element {
           ) : trend.length > 1 ? (
             <div style={{ padding: '4px 20px 18px' }}>
               <AreaChart
-                points={trend.map((p) => p.avgQuality)}
+                points={trend.map((p) => p.successRate)}
                 height={200}
-                yFormat={(v) => v.toFixed(0)}
+                yFormat={(v) => `${Math.round(v * 100)}%`}
                 xLabels={trend.map((p) => p.day)}
               />
             </div>

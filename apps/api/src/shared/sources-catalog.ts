@@ -18,25 +18,50 @@ import type { ProxyProtocol } from '@proxyforge/contracts';
  *
  * ## 同步周期为什么统一压到 15 分钟
  *
- * 原来是 30–120 分钟。理由是"内容不会变得那么快"，但这个理由没被验证过，
- * 而实测是反的：对每个启用源的历史快照统计 content_hash，
- * **重复率是 0%** —— 每一次同步拿到的都是不同内容（如 hideipme-socks5
- * 10 次快照 10 个不同 hash，体量在 84–185 条之间来回摆动）。
+ * 原来是 30–120 分钟。压到 15 分钟的理由**当时写错了**，这里改正：
  *
- * 也就是说列表一直在换血，而我们是**欠采样**的：一小时拉一次，就只看到
- * 换血过程的 1/6，剩下 5/6 出现过的 IP 我们从未见过。免费代理 IP 存活期
- * 是几十分钟量级，晚 45 分钟看到它，基本等于没看到。
+ * 原注释说"统计历史快照的 content_hash，重复率是 0%，说明列表一直在换血、
+ * 我们是欠采样的"。这个结论是循环论证 —— `syncSource` 在 content_hash
+ * 命中时**不写快照行**，所以 `source_snapshots` 里按定义只有互不相同的
+ * hash，`distinct / snaps` 恒等于 1。那个 0% 不是测出来的，是这个指标在
+ * 这套数据模型下不可能不为 0。现网日志里 `同步 3 个源（成功 3）新增候选 0`
+ * 反复出现，直接反证了它。
  *
- * 代价很小，因为内容没变时同步是**接近零成本**的：`syncSource` 先比对
- * content_hash，命中就返回 `duplicateSnapshot: true`，不写快照、不解析、
- * 不产生候选。所以"多拉几次"只在内容真的变了的时候才有实际开销。
+ * 正确的理由只剩一条，但它足够成立：**收益在"更早看到"，不在"看到更多"**。
+ * 免费代理 IP 存活期是几十分钟量级，同步周期直接决定了我们看到的列表
+ * 有多旧 —— 15 分钟周期意味着平均滞后 7.5 分钟，而对一个活了 30 分钟的
+ * IP，晚 15 分钟发现它，探测完基本已经死了。提频买的是**新鲜度**，
+ * 代价是重复拉取，而重复拉取在 content_hash 命中时接近零成本。
  *
- * 重复率会上升，但那是**便宜的重复**：重复候选在晋级时被标 DUPLICATE，
- * 不进探测队列。真正要盯的指标是探测预算的产出率，不是候选表的重复率。
+ * 重复率现在可测了（`sync_attempts` / `duplicate_syncs`，见 migrations/0019），
+ * 周期该定多少以后按它算，不再靠断言。
  *
  * 下限由 `PATCH /sources/:id` 校验（≥300 秒），避免把周期写成 1 秒
  * 变成对源站的压测。
+ *
+ * ## 为什么后来不再统一，而是按隧道率分档（2026-11）
+ *
+ * "统一压到 15 分钟"只解决了"欠采样"，没解决"采样到哪里"。
+ *
+ * 订阅能用的节点被 `connect_ok IS TRUE` 卡死：全库 1,125 个 HEALTHY 里只有
+ * 227 个能建 CONNECT 隧道。这批"被判不可用"的节点在**空闲条件下以并发 8
+ * 复核**仍然只有 3/76（4%）能建隧道（`scripts/diag-tunnel.mts`）——
+ * 所以 20% 是真值，不是并发压出来的假失败。
+ *
+ * 隧道率既然是硬约束，源的价值就该按**能产出多少可下发节点**衡量。
+ * 实测同一时刻各源的 HEALTHY / 隧道可用，差距是 250 倍：
+ *
+ *   hideipme-http    18 / 18   100.0%      thespeedx-socks4  148 /  1    0.7%
+ *   monosans-socks5   9 /  9   100.0%      iplocate-socks5   174 /  7    4.0%
+ *   monosans-socks4   5 /  4    80.0%      hookzof-socks5    167 / 12    7.2%
+ *   hideipme-socks5  27 / 20    74.1%      thespeedx-http    152 / 32   21.1%
+ *
+ * 于是分三档：高隧道率压到 300 秒（下限），低隧道率放宽到 1800 秒。
+ * 免费代理存活期是几十分钟量级，同步越慢，抓到的 IP 到探测时活着的越少 ——
+ * 对 74–100% 的源缩短周期是**直接**增加可用节点；对 4% 的源，缩短周期
+ * 只是更快地灌进来一批注定失败的候选。
  */
+const SYNC_HOT = 300;
 const SYNC_FAST = 900;
 const SYNC_SLOW = 1800;
 
@@ -64,8 +89,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 48,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '纯 host:port，体量大、更新勤，存活率中等',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: '纯 host:port，体量大、更新勤。存活 152 个里 32 个能建隧道（21.1%），绝对值全库第一 —— 隧道率不高但分母大，值得高频同步',
   },
   {
     key: 'thespeedx-socks4',
@@ -75,8 +100,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS4',
     trustLevel: 45,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '纯 host:port',
+    syncIntervalSeconds: SYNC_SLOW,
+    notes: '⚠ 148 个 HEALTHY 只产出 1 个可用（0.7%）。节点能建 SOCKS4 握手到 80 端口，443 全部失败 —— 占着探测预算和健康计数，产出接近于零，周期已放宽',
   },
   {
     key: 'thespeedx-socks5',
@@ -99,8 +124,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 52,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '上游会先做存活检查，条目少但命中率高',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: '上游会先做存活检查，条目少但命中率高。实测隧道率 84.6%（33/39），但 URL 现已失效（last_sync_status = FAILED），等上游恢复',
   },
   {
     key: 'monosans-socks4',
@@ -110,8 +135,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS4',
     trustLevel: 50,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '同上',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: '同上。实测隧道率 80.0%（4/5）—— SOCKS4 这一档里唯一有产出的源',
   },
   {
     key: 'monosans-socks5',
@@ -121,8 +146,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 52,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '同上',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: '同上。实测隧道率 100%（9/9），条目少但每一个都能下发',
   },
 
   // ── OpenProxyList：聚合站，单文件体量最大 ──
@@ -180,8 +205,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 45,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '专做 SOCKS5，体量可观',
+    syncIntervalSeconds: SYNC_SLOW,
+    notes: '专做 SOCKS5，体量可观。实测 167 个 HEALTHY 只产出 12 个可用（7.2%），周期已放宽',
   },
   {
     key: 'hideipme-http',
@@ -191,8 +216,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'HTTP',
     trustLevel: 38,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: 'host:port:国家 三段格式，抽取时会丢掉国家标注',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: 'host:port:国家 三段格式，抽取时会丢掉国家标注。实测隧道率 100%（18/18）—— 条目少但全部可下发，是全库性价比最高的源',
   },
   {
     key: 'hideipme-socks5',
@@ -202,8 +227,8 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 38,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: 'host:port:国家 三段格式',
+    syncIntervalSeconds: SYNC_HOT,
+    notes: 'host:port:国家 三段格式。实测隧道率 74.1%（20/27），全库第二高的绝对可用数',
   },
 
   // ── 2026-11 扩源评估新增 ──
@@ -235,8 +260,12 @@ export const CATALOG: CatalogEntry[] = [
     formatHint: 'text',
     protocolHint: 'SOCKS5',
     trustLevel: 40,
-    syncIntervalSeconds: SYNC_FAST,
-    notes: '24 条抽样：存活 13（54%）、能建隧道 3（12.5%）。899 条 × 12.5% ≈ 112 个可用隧道/轮，绝对量最大',
+    syncIntervalSeconds: SYNC_SLOW,
+    notes:
+      '⚠ 上一轮按 24 条抽样（存活 13、隧道 3）加进来，并写下"产出最高的一支"—— ' +
+      '全量跑完是 7/174（4.0%），那句话是错的。它现在是全库最大的死重：' +
+      '174 个 HEALTHY 占着探测预算，只换 7 个可用节点。周期已放宽到 30 分钟，' +
+      '保留条目因为隧道率 4% 不算零，且它的条目数在变。',
   },
   {
     key: 'proxylistto-socks5',

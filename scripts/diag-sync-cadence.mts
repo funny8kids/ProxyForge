@@ -8,10 +8,22 @@
  * 但盲目把所有源改成 10 分钟也没意义：内容一小时才换一次的源，多拉 5 次
  * 全是同一个 content_hash，纯属白烧 HTTP 与解析。所以频率要按**实测换血速度**定。
  *
- * 这个脚本只回答一件事：每个源的历史快照里，不同 content_hash 之间隔多久。
+ * 这个脚本回答两件事：
+ *   1. 每个源的历史快照里，不同 content_hash 之间隔多久（换血间隔）
+ *   2. 重复率 —— **必须用 `duplicateSyncs / syncAttempts` 这两个计数器算**
+ *
+ * 第 2 点踩过一次坑，记在这里免得再犯：早先版本用
+ * `1 - distinct / snaps` 当重复率，而 `syncSource` 在 content_hash 命中时
+ * 根本不写快照行，于是 `distinct / snaps` 恒等于 1、重复率恒等于 0%。
+ * 那个 0% 不是测出来的，是这个指标在这套数据模型下**不可能不为 0**，
+ * 却让我据此断言"列表一直在换血、我们只看到 1/6"—— 现网日志里
+ * `同步 3 个源（成功 3）新增候选 0` 反复出现，直接反证了它。
+ *
+ * 分母必须先被记下来，比值才有意义。计数器见 migrations/0019。
+ *
  * 只读 HTTP，不碰库。
  *
- * 跑法：node scripts/diag-sync-cadence.mts
+ * 跑法：npm run diag:cadence
  */
 
 const BASE = process.env.PF_API_BASE ?? 'http://127.0.0.1:8081/api/v1';
@@ -31,6 +43,10 @@ interface Source {
   type: string;
   syncIntervalSeconds: number;
   lastSyncStatus: string;
+  /** 成功取到内容的次数（重复与新内容都算）。重复率的分母 */
+  syncAttempts: number;
+  /** 内容未变、未写快照的次数。重复率的分子 */
+  duplicateSyncs: number;
 }
 
 async function login(): Promise<string> {
@@ -67,6 +83,7 @@ async function main(): Promise<void> {
     changeEveryMin: number | null;
     windowHours: number;
     dupRate: number;
+    attempts: number;
     note: string;
   }
   const rows: Row[] = [];
@@ -76,7 +93,8 @@ async function main(): Promise<void> {
     if (!res.ok) {
       rows.push({
         key: s.key, intervalMin: s.syncIntervalSeconds / 60, snaps: 0, distinct: 0,
-        changeEveryMin: null, windowHours: 0, dupRate: 0, note: `快照接口 ${res.status}`,
+        changeEveryMin: null, windowHours: 0, dupRate: 0, attempts: s.syncAttempts,
+        note: `快照接口 ${res.status}`,
       });
       continue;
     }
@@ -111,23 +129,28 @@ async function main(): Promise<void> {
       distinct,
       changeEveryMin: median(gaps),
       windowHours: Math.round(windowMin / 6) / 10,
-      dupRate: snaps.length ? 1 - distinct / snaps.length : 0,
-      note: snaps.length < 3 ? '快照太少，不足以下结论' : '',
+      // 重复率只能来自计数器 —— `distinct / snaps` 恒等于 1，见文件头
+      dupRate: s.syncAttempts > 0 ? s.duplicateSyncs / s.syncAttempts : 0,
+      attempts: s.syncAttempts,
+      note: s.syncAttempts === 0
+        ? '计数器上线后还没同步过'
+        : snaps.length < 3 ? '快照太少，换血间隔不足以下结论' : '',
     });
   }
 
   const p = (v: string | number, w: number): string => String(v).padEnd(w);
   console.log(
-    '\n' + p('源', 24) + p('当前周期', 10) + p('快照', 6) + p('不同内容', 10) +
+    '\n' + p('源', 24) + p('当前周期', 10) + p('尝试', 6) + p('快照', 6) + p('不同内容', 10) +
     p('重复率', 8) + p('覆盖时长', 10) + '换血间隔(中位)',
   );
-  console.log('-'.repeat(96));
+  console.log('-'.repeat(104));
   rows.sort((a, b) => (a.changeEveryMin ?? 1e9) - (b.changeEveryMin ?? 1e9));
   for (const r of rows) {
     console.log(
-      p(r.key, 24) + p(`${r.intervalMin}分`, 10) + p(r.snaps, 6) + p(r.distinct, 10) +
+      p(r.key, 24) + p(`${r.intervalMin}分`, 10) + p(r.attempts, 6) +
+      p(r.snaps, 6) + p(r.distinct, 10) +
       p(`${(r.dupRate * 100).toFixed(0)}%`, 8) + p(`${r.windowHours}h`, 10) +
-      (r.changeEveryMin === null ? '—（观察期内没换过）' : `${r.changeEveryMin} 分`) +
+      (r.changeEveryMin === null ? '—（观察期内没换过）' : `${r.changeEveryMin.toFixed(1)} 分`) +
       (r.note ? `  [${r.note}]` : ''),
     );
   }
@@ -137,8 +160,24 @@ async function main(): Promise<void> {
   const fast = measurable.filter((r) => (r.changeEveryMin ?? 1e9) <= 20);
   const slow = measurable.filter((r) => (r.changeEveryMin ?? 0) > 60);
   console.log(`  换血 ≤20 分钟：${fast.length} 个 —— 提频有收益`);
-  console.log(`  换血 >60 分钟：${slow.length} 个 —— 提频纯属白拉`);
+  console.log(`  换血 >60 分钟：${slow.length} 个 —— 提频买不到新内容`);
   if (fast.length) console.log(`  值得提频的：${fast.map((r) => r.key).join(', ')}`);
+
+  // 这条限制必须印出来，否则读表的人会把"换血间隔"当成真值。
+  //
+  // 换血间隔是**相邻两次落库快照**的时间差，而快照只在内容变化时才写 ——
+  // 所以这个值被历史同步周期量化了：一个每 5 分钟变一次的源，在 15 分钟
+  // 周期下测出来就是 15 分钟。**等于历史周期的那一行只说明"每次同步都变了"，
+  // 是上界，不是真实间隔**。要看真值，得在提频之后再测一轮。
+  const quantized = measurable.filter(
+    (r) => r.changeEveryMin !== null && r.changeEveryMin <= r.intervalMin * 1.1,
+  );
+  if (quantized.length) {
+    console.log(
+      `\n注意：${quantized.map((r) => r.key).join(', ')} 的换血间隔贴近当前周期，` +
+        '说明观察期内**每次同步内容都变了** —— 这个数是上界，不是真实换血间隔。',
+    );
+  }
 }
 
 main().catch((e) => {

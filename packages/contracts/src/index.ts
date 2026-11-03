@@ -283,6 +283,15 @@ export interface SourceSummary {
   /** 被系统自动停用的时间（AUTHORIZED 来源不会走到这里） */
   autoDisabledAt: string | null;
   autoDisableReason: string | null;
+  /**
+   * 累计「成功取到内容」的次数（新内容与重复内容都算，拉取失败不算）。
+   *
+   * 它存在的唯一理由是给重复率一个分母：内容未变时不写快照行，
+   * 于是 `distinct / snapshots` 恒等于 1，重复率永远显示 0%。
+   */
+  syncAttempts: number;
+  /** 累计「内容与上次完全相同」的次数。重复率 = duplicateSyncs / syncAttempts */
+  duplicateSyncs: number;
 }
 
 export interface SourceSyncOutcome {

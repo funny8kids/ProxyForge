@@ -37,7 +37,8 @@
     "check:subscription": "node scripts/check-subscription.mjs",
     "test:promote": "node node_modules/tsx/dist/cli.mjs scripts/promote-order.test.mts",
     "diag:cadence": "node node_modules/tsx/dist/cli.mjs scripts/diag-sync-cadence.mts",
-    "diag:demoted": "node node_modules/tsx/dist/cli.mjs scripts/diag-demoted.mts"
+    "diag:demoted": "node node_modules/tsx/dist/cli.mjs scripts/diag-demoted.mts",
+    "diag:tunnel": "node node_modules/tsx/dist/cli.mjs scripts/diag-tunnel.mts"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

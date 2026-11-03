@@ -60,6 +60,7 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
               s.trust_level, s.enabled, s.sync_interval_seconds, s.last_synced_at, s.notes, s.config,
               s.last_sync_status, s.last_sync_error, s.quality_score, s.quality_sample_size,
               s.auto_disabled_at, s.auto_disable_reason,
+              s.sync_attempts, s.duplicate_syncs,
               COALESCE(c.pending, 0)  AS pending,
               COALESCE(c.total, 0)    AS total,
               COALESCE(c.promoted, 0) AS promoted
@@ -106,6 +107,8 @@ export async function registerSourceRoutes(app: FastifyInstance): Promise<void> 
           qualitySampleSize: Number(r.quality_sample_size ?? 0),
           autoDisabledAt: r.auto_disabled_at ? String(r.auto_disabled_at) : null,
           autoDisableReason: (r.auto_disable_reason as string) ?? null,
+          syncAttempts: Number(r.sync_attempts ?? 0),
+          duplicateSyncs: Number(r.duplicate_syncs ?? 0),
         };
       }),
     };
@@ -795,10 +798,18 @@ export async function syncSource(
     );
     if (existing) {
       duplicateSnapshot = true;
-      // 内容没变也要刷新 last_synced_at，否则界面会一直显示"从未同步"
+      // 内容没变也要刷新 last_synced_at，否则界面会一直显示"从未同步"。
+      //
+      // 同时累加两个计数器 —— 这是唯一能算出真实重复率的地方：
+      // 命中时不写快照行，于是"重复"这件事除了这里没有别的落点。
+      // 没有它，`distinct / snaps` 恒等于 1，重复率会永远显示 0%
+      // （见 migrations/0019）。
       await t.exec(
         `UPDATE resource_sources SET last_synced_at = now(), last_attempt_at = now(),
-                last_sync_status = 'OK', last_sync_error = NULL WHERE id = $1`,
+                last_sync_status = 'OK', last_sync_error = NULL,
+                sync_attempts = sync_attempts + 1,
+                duplicate_syncs = duplicate_syncs + 1
+          WHERE id = $1`,
         [source.id],
       );
       return;
@@ -835,7 +846,9 @@ export async function syncSource(
     await t.exec('UPDATE source_snapshots SET candidate_count = $2 WHERE id = $1', [snapshotId, inserted]);
     await t.exec(
       `UPDATE resource_sources SET last_synced_at = now(), last_attempt_at = now(),
-              last_sync_status = 'OK', last_sync_error = NULL, last_snapshot_id = $2 WHERE id = $1`,
+              last_sync_status = 'OK', last_sync_error = NULL, last_snapshot_id = $2,
+              sync_attempts = sync_attempts + 1
+        WHERE id = $1`,
       [source.id, snapshotId],
     );
     await audit(t, {

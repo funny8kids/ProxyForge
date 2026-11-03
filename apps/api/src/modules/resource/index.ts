@@ -10,7 +10,7 @@ import type {
   ProxyProtocol,
   TrustTier,
 } from '@proxyforge/contracts';
-import { LIFECYCLE_STATUSES, ORIGIN_TYPES, PROXY_PROTOCOLS, TRUST_TIERS } from '@proxyforge/contracts';
+import { AUTHORIZATION_STATUSES, LIFECYCLE_STATUSES, ORIGIN_TYPES, PROXY_PROTOCOLS, TRUST_TIERS } from '@proxyforge/contracts';
 import { exec, q, q1, tx } from '../../db/client.js';
 import { actorOf, guard } from '../auth/index.js';
 import { audit, emit, EVENT_TYPES } from '../../shared/events.js';
@@ -114,6 +114,15 @@ export async function registerResourceRoutes(app: FastifyInstance): Promise<void
     const tiers = parseEnumList(query.tier, TRUST_TIERS, 'tier');
     const protocols = parseEnumList(query.protocol, PROXY_PROTOCOLS, 'protocol');
     const origins = parseEnumList(query.originType, ORIGIN_TYPES, 'originType');
+    /**
+     * 授权状态筛选。加它是因为「库里还有没有已授权端点」在此之前
+     * **没有任何接口能回答** —— 只能拉全表自己数。
+     *
+     * 正式池的成员数直接取决于这个数：池的 `allowed_tiers` 不含 PUBLIC_PROXY，
+     * 所以一旦采集把库填满公开代理，正式策略就会（正确地）编译出 0 成员。
+     * 验收脚本要能区分「不变量在生效」和「编译器坏了」，就得先问出这个数。
+     */
+    const authStatuses = parseEnumList(query.authorizationStatus, AUTHORIZATION_STATUSES, 'authorizationStatus');
 
     const where: string[] = ['e.deleted_at IS NULL'];
     const params: unknown[] = [];
@@ -133,6 +142,10 @@ export async function registerResourceRoutes(app: FastifyInstance): Promise<void
     if (origins.length) {
       params.push(origins);
       where.push(`e.origin_type::text = ANY($${params.length}::text[])`);
+    }
+    if (authStatuses.length) {
+      params.push(authStatuses);
+      where.push(`e.authorization_status::text = ANY($${params.length}::text[])`);
     }
     if (query.minQuality) {
       params.push(Number(query.minQuality));

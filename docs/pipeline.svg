@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-label="ProxyForge 现状快照：累计 153,994 条候选，此刻 94 个可用出口">
+  <defs>
+    <linearGradient id="pbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1018"/>
+      <stop offset="1" stop-color="#080B12"/>
+    </linearGradient>
+    <linearGradient id="fill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8B7CFF"/>
+      <stop offset="0.55" stop-color="#6E9BE8"/>
+      <stop offset="1" stop-color="#36D6C3"/>
+    </linearGradient>
+    <linearGradient id="fillDim" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#6E9BE8" stop-opacity="0.55"/>
+    </linearGradient>
+    <radialGradient id="pg1" cx="0.12" cy="0.06" r="0.5">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#8B7CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="pg2" cx="0.9" cy="0.95" r="0.45">
+      <stop offset="0" stop-color="#36D6C3" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#36D6C3" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="620" fill="url(#pbg)"/>
+  <rect width="1200" height="620" fill="url(#pg1)"/>
+  <rect width="1200" height="620" fill="url(#pg2)"/>
+  <rect x="0.5" y="0.5" width="1199" height="619" fill="none" stroke="#8B7CFF" stroke-opacity="0.14"/>
+
+  <g font-family="'SF Mono',ui-monospace,Menlo,Consolas,monospace">
+    <text x="60" y="56" font-size="11" letter-spacing="5.4" fill="#697386">STATE SNAPSHOT · 2026-11-03</text>
+  </g>
+  <g font-family="'PingFang SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+    <text x="60" y="102" font-size="25" font-weight="600" fill="#E8EDF7">累计见过 153,994 条候选，此刻只剩 94 个能用</text>
+    <text x="60" y="130" font-size="13" fill="#697386">不是转化率低，是 IP 一直在换手 —— 这是库存型资源，不是流量型资源。</text>
+  </g>
+
+  <line x1="60" y1="152" x2="1140" y2="152" stroke="#8B7CFF" stroke-opacity="0.10"/>
+
+  <!-- ===== 流量区 ===== -->
+  <g font-family="'SF Mono',ui-monospace,Menlo,monospace">
+    <rect x="60" y="170" width="104" height="18" rx="3" fill="#8B7CFF" fill-opacity="0.10" stroke="#8B7CFF" stroke-opacity="0.28"/>
+    <text x="112" y="183" text-anchor="middle" font-size="9.5" letter-spacing="2" fill="#B3A8FF">FLOW · 累计</text>
+  </g>
+
+  <g font-family="'PingFang SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+    <text x="92" y="228" font-size="14" fill="#E8EDF7">候选行</text>
+    <text x="92" y="248" font-size="11" fill="#697386">19 个公开源持续同步，一次全量 20.5 秒</text>
+    <text x="92" y="296" font-size="14" fill="#E8EDF7">去重后独立端点</text>
+    <text x="92" y="316" font-size="11" fill="#697386">93,886 条重复（61%）被拦在门外</text>
+  </g>
+  <text x="60" y="228" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10" fill="#4A5464">01</text>
+  <text x="60" y="296" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10" fill="#4A5464">02</text>
+
+  <rect x="370" y="212" width="610" height="10" rx="5" fill="#121A29"/>
+  <rect x="370" y="212" width="608" height="10" rx="5" fill="url(#fill)" opacity="0.95"/>
+  <text x="1140" y="223" text-anchor="end" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="19" font-weight="600" fill="#E8EDF7">153,994</text>
+
+  <rect x="370" y="280" width="610" height="10" rx="5" fill="#121A29"/>
+  <rect x="370" y="280" width="532" height="10" rx="5" fill="url(#fill)" opacity="0.85"/>
+  <text x="1140" y="291" text-anchor="end" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="19" font-weight="600" fill="#E8EDF7">59,934</text>
+
+  <!-- 分隔 -->
+  <line x1="60" y1="344" x2="1140" y2="344" stroke="#8B7CFF" stroke-opacity="0.16" stroke-dasharray="3 5"/>
+
+  <!-- ===== 库存区 ===== -->
+  <g font-family="'SF Mono',ui-monospace,Menlo,monospace">
+    <rect x="60" y="360" width="104" height="18" rx="3" fill="#36D6C3" fill-opacity="0.09" stroke="#36D6C3" stroke-opacity="0.30"/>
+    <text x="112" y="373" text-anchor="middle" font-size="9.5" letter-spacing="2" fill="#7FE7E1">STOCK · 此刻</text>
+  </g>
+
+  <g font-family="'PingFang SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+    <text x="92" y="418" font-size="14" fill="#E8EDF7">HEALTHY</text>
+    <text x="92" y="438" font-size="11" fill="#697386">L1–L6 全部通过，连续成功 ≥2 次</text>
+    <text x="92" y="486" font-size="14" fill="#E8EDF7">进入订阅</text>
+    <text x="92" y="506" font-size="11" fill="#697386">还需能建 CONNECT 隧道（约 20% 满足）</text>
+    <text x="92" y="554" font-size="14" fill="#7FE7E1">实测可用</text>
+    <text x="92" y="574" font-size="11" fill="#697386">拉订阅 → 逐节点真连 → 统计成功</text>
+  </g>
+  <text x="60" y="418" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10" fill="#4A5464">03</text>
+  <text x="60" y="486" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10" fill="#4A5464">04</text>
+  <text x="60" y="554" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="10" fill="#36D6C3">05</text>
+
+  <rect x="370" y="402" width="610" height="10" rx="5" fill="#121A29"/>
+  <rect x="370" y="402" width="195" height="10" rx="5" fill="url(#fill)" opacity="0.8"/>
+  <text x="1140" y="413" text-anchor="end" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="19" font-weight="600" fill="#E8EDF7">898</text>
+
+  <rect x="370" y="470" width="610" height="10" rx="5" fill="#121A29"/>
+  <rect x="370" y="470" width="72" height="10" rx="5" fill="url(#fill)" opacity="0.75"/>
+  <text x="1140" y="481" text-anchor="end" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="19" font-weight="600" fill="#E8EDF7">196</text>
+
+  <rect x="370" y="538" width="610" height="10" rx="5" fill="#121A29"/>
+  <rect x="370" y="538" width="16" height="10" rx="5" fill="#36D6C3"/>
+  <text x="1140" y="549" text-anchor="end" font-family="'SF Mono',ui-monospace,Menlo,monospace" font-size="19" font-weight="600" fill="#7FE7E1">94</text>
+
+  <text x="60" y="606" font-family="'PingFang SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif"
+        font-size="11" fill="#697386">条形按对数刻度绘制。上两行是流量（累计流过多少），下三行是库存（此刻还剩多少）—— 两者不能相除，所以不画成一个漏斗。</text>
+</svg>

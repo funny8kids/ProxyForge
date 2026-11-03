@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="460" viewBox="0 0 1200 460" role="img" aria-label="ProxyForge — network egress infrastructure">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1018"/>
+      <stop offset="0.55" stop-color="#080B12"/>
+      <stop offset="1" stop-color="#0A0F16"/>
+    </linearGradient>
+    <radialGradient id="glowV" cx="0.22" cy="0.18" r="0.62">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#8B7CFF" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#8B7CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowC" cx="0.82" cy="0.86" r="0.58">
+      <stop offset="0" stop-color="#36D6C3" stop-opacity="0.22"/>
+      <stop offset="0.6" stop-color="#36D6C3" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#36D6C3" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0.35">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.42" stop-color="#CFC8FF"/>
+      <stop offset="0.72" stop-color="#8B7CFF"/>
+      <stop offset="1" stop-color="#36D6C3"/>
+    </linearGradient>
+    <linearGradient id="rule" gradientUnits="userSpaceOnUse" x1="330" y1="240" x2="870" y2="240">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0"/>
+      <stop offset="0.15" stop-color="#8B7CFF" stop-opacity="0.85"/>
+      <stop offset="0.5" stop-color="#B9B0FF" stop-opacity="0.95"/>
+      <stop offset="0.85" stop-color="#36D6C3" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#36D6C3" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="line" gradientUnits="userSpaceOnUse" x1="290" y1="366" x2="910" y2="366">
+      <stop offset="0" stop-color="#8B7CFF" stop-opacity="0.10"/>
+      <stop offset="0.5" stop-color="#A99BFF" stop-opacity="0.60"/>
+      <stop offset="1" stop-color="#36D6C3" stop-opacity="0.10"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#8B7CFF" stroke-opacity="0.055" stroke-width="1"/>
+    </pattern>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="460" fill="url(#bg)"/>
+  <rect width="1200" height="460" fill="url(#grid)"/>
+  <rect width="1200" height="460" fill="url(#glowV)"/>
+  <rect width="1200" height="460" fill="url(#glowC)"/>
+  <rect x="0.5" y="0.5" width="1199" height="459" fill="none" stroke="#8B7CFF" stroke-opacity="0.16"/>
+
+  <text x="600" y="112" text-anchor="middle" font-family="'SF Mono',ui-monospace,Menlo,Consolas,monospace"
+        font-size="11.5" letter-spacing="6.2" fill="#697386">NETWORK EGRESS INFRASTRUCTURE</text>
+
+  <text x="600" y="212" text-anchor="middle" font-family="'SF Pro Display',-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="86" font-weight="700" letter-spacing="-2.6" fill="url(#word)">ProxyForge</text>
+
+  <rect x="330" y="240" width="540" height="1.5" fill="url(#rule)"/>
+
+  <text x="600" y="278" text-anchor="middle" font-family="'SF Pro Text',-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="17" letter-spacing="0.2" fill="#9AA5B8">把零散代理资源，变成可审计、可签名、可下发的网络出口</text>
+
+  <g stroke="url(#line)" stroke-width="1.6" fill="none">
+    <path d="M300 366 H900"/>
+  </g>
+
+  <g font-family="'SF Mono',ui-monospace,Menlo,Consolas,monospace" font-size="9.5" letter-spacing="2.4" text-anchor="middle">
+    <g>
+      <circle cx="300" cy="366" r="4.5" fill="#8B7CFF"/>
+      <circle cx="300" cy="366" r="10" fill="#8B7CFF" opacity="0.16"/>
+      <text x="300" y="398" fill="#B3A8FF">DISCOVER</text>
+    </g>
+    <g>
+      <circle cx="450" cy="366" r="4.5" fill="#9A8BFB"/>
+      <circle cx="450" cy="366" r="10" fill="#9A8BFB" opacity="0.14"/>
+      <text x="450" y="398" fill="#B3A8FF">VERIFY</text>
+    </g>
+    <g>
+      <circle cx="600" cy="366" r="4.5" fill="#63BFD8"/>
+      <circle cx="600" cy="366" r="10" fill="#63BFD8" opacity="0.14"/>
+      <text x="600" y="398" fill="#9FC9DC">TIER</text>
+    </g>
+    <g>
+      <circle cx="750" cy="366" r="4.5" fill="#4ACDD1"/>
+      <circle cx="750" cy="366" r="10" fill="#4ACDD1" opacity="0.14"/>
+      <text x="750" y="398" fill="#8FD8DA">POOL</text>
+    </g>
+    <g>
+      <circle cx="900" cy="366" r="4.5" fill="#36D6C3"/>
+      <circle cx="900" cy="366" r="10" fill="#36D6C3" opacity="0.16"/>
+      <text x="900" y="398" fill="#7FE7E1">SIGN</text>
+    </g>
+  </g>
+
+  <g filter="url(#soft)" opacity="0.5">
+    <circle cx="900" cy="366" r="16" fill="#36D6C3" opacity="0.35"/>
+  </g>
+</svg>

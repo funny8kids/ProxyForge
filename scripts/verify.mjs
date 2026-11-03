@@ -108,7 +108,22 @@ check('编译覆盖全部实例', insts.length >= 2, `count=${insts.length}`);
 const primaryInst = insts.find((i) => i.name.includes('primary')) ?? insts[0];
 const labInst = insts.find((i) => i.name.includes('lab'));
 
-check('正式实例编译出成员', primaryInst.memberCount > 0, `members=${primaryInst.memberCount}`);
+// 正式实例的成员数取决于**库里有没有已授权端点**，不是编译器的行为。
+// 曾经这里断言 memberCount > 0，前提是种子数据里有一个 AUTHORIZED + VERIFIED 的端点；
+// 但库跑过真实采集之后，全部 59,934 个端点都是 PUBLIC_PROXY + UNKNOWN，
+// 于是这条断言必然失败 —— 而失败说明的是**不变量在生效**，不是编译坏了。
+//
+// 所以改断言「不变量」而不是「某个数字」：
+//   · 库里没有任何已授权端点 → 正式实例必须编出 0 成员（而不是报错或降级放行）
+//   · 库里确实有 → 必须编出成员
+// 两种情况下都检查渲染产物，避免 0 成员时后面的段断言变成空转。
+const authd = await api('/api/v1/resources?limit=1&authorizationStatus=AUTHORIZED');
+const authorizedCount = authd.body.total ?? 0;
+check(
+  authorizedCount > 0 ? '正式实例编译出成员' : '无已授权端点时正式实例编出 0 成员（不变量）',
+  authorizedCount > 0 ? primaryInst.memberCount > 0 : primaryInst.memberCount === 0,
+  `members=${primaryInst.memberCount} authorized=${authorizedCount}`,
+);
 
 const primaryCfgs = (await api(`/api/v1/gateway/configs?instanceId=${primaryInst.instanceId}`)).body.items ?? [];
 const primaryCfg = primaryCfgs.find((c) => c.version === primaryInst.version) ?? primaryCfgs[0];
@@ -118,6 +133,7 @@ check('正式配置含 services 段', pr.includes('services:'));
 check('正式配置含 chains 段', pr.includes('chains:'));
 check('正式配置不含实验隔离段', !pr.includes('EXPERIMENTAL ISOLATION'));
 check('正式配置未泄露凭据', !/password:\s*\S/.test(pr));
+check('正式配置不出现公开代理出口', !pr.includes('PUBLIC_PROXY'), '公开代理不得进入正式配置');
 
 if (labInst) {
   const labCfgs = (await api(`/api/v1/gateway/configs?instanceId=${labInst.instanceId}`)).body.items ?? [];
